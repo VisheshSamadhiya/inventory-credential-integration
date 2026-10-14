@@ -1,0 +1,9 @@
+.git
+.git/**
+.env
+.env.*
+*.zip
+*.xlsx
+backups
+storage/logs
+tests
