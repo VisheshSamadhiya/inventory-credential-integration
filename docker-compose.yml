@@ -18,6 +18,7 @@ services:
       DB_NAME: ${DB_NAME}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
+      ASSET_TAG_BATCH_SIZE: ${ASSET_TAG_BATCH_SIZE:-250}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       CREDENTIAL_ATTACHMENT_PATH: /var/lib/inventory-manager/credential-attachments
       AWS_REGION: ${AWS_REGION:-}
@@ -66,6 +67,46 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  order-email-worker:
+    image: ${APP_IMAGE:-inventory-manager}:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["sh", "-c", "while true; do php /var/www/html/bin/process_order_email_outbox.php; sleep 30; done"]
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  asset-tag-worker:
+    image: ${APP_IMAGE:-inventory-manager}:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["php", "/var/www/html/bin/process_asset_tag_jobs.php"]
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      ASSET_TAG_BATCH_SIZE: ${ASSET_TAG_BATCH_SIZE:-250}
     depends_on:
       db:
         condition: service_healthy

@@ -2,7 +2,7 @@
  const backLink=document.querySelector('[data-app-back]');
  if(!backLink)return;
  const previousKey='im-app-previous-page';
- const appRoutes=new Set(['dashboard.php','products.php','inventory.php','assignments.php','employees.php','employee.php','categories.php','orders.php','vendors.php','vendor.php','history.php','users.php','audit_logs.php','credentials.php','credential-access.php','search.php']);
+ const appRoutes=new Set(['dashboard.php','products.php','inventory.php','category-inventory.php','inventory-details.php','hardware-assets.php','assignments.php','employees.php','employee.php','categories.php','orders.php','vendors.php','vendor.php','history.php','users.php','audit_logs.php','credentials.php','credential-access.php','search.php']);
  const basePath=window.location.pathname.slice(0,window.location.pathname.lastIndexOf('/')+1);
  let internalDeparture=false;
 

@@ -11,12 +11,21 @@ $groups = [];
 if ($query !== '') {
     $pdo = db();
     $like = '%' . $query . '%';
+    $canSeeEmployeeDetails = canViewResource('employees');
+    $hardwareSearchSql = 'SELECT a.id,a.product_id,a.asset_tag,a.serial_number,a.internal_serial_number,a.status,a.location,p.name AS product_name, '
+        . ($canSeeEmployeeDetails ? 'e.id AS assigned_employee_id,e.full_name AS assigned_employee' : 'NULL AS assigned_employee_id,NULL AS assigned_employee') . '
+        FROM inventory_assets a JOIN products p ON p.id=a.product_id'
+        . ($canSeeEmployeeDetails ? ' LEFT JOIN active_hardware_assignments active ON active.asset_id=a.id LEFT JOIN assignments assignment ON assignment.id=active.assignment_id LEFT JOIN employees e ON e.id=assignment.employee_record_id' : '')
+        . ' WHERE a.asset_tag LIKE ? OR a.serial_number LIKE ? OR a.internal_serial_number LIKE ? OR p.name LIKE ? OR a.location LIKE ?'
+        . ($canSeeEmployeeDetails ? ' OR e.full_name LIKE ? OR e.employee_id LIKE ? OR e.location LIKE ?' : '')
+        . ' ORDER BY a.asset_tag LIMIT 10';
+    $hardwareSearchParams=[$like,$like,$like,$like,$like];
+    if($canSeeEmployeeDetails)array_push($hardwareSearchParams,$like,$like,$like);
     $run = static function (string $sql, array $params) use ($pdo): array {
         $statement = $pdo->prepare($sql);
         $statement->execute($params);
         return $statement->fetchAll();
     };
-    $canSeeEmployeeDetails = canViewResource('employees');
     $searches = [
         'Inventory' => ['products', fn(): array => $run(
             'SELECT p.id, p.name, p.brand, p.model, c.name AS category_name
@@ -31,15 +40,7 @@ if ($query !== '') {
              ORDER BY full_name LIMIT 10',
             [$like, $like, $like, $like]
         )],
-        'Hardware' => ['hardware', fn(): array => $run(
-            'SELECT a.id, a.product_id, a.asset_tag, a.serial_number, a.status, a.location, p.name AS product_name, '
-             . ($canSeeEmployeeDetails ? 'e.id AS assigned_employee_id, e.full_name AS assigned_employee' : 'NULL AS assigned_employee_id, NULL AS assigned_employee') . '
-             FROM inventory_assets a JOIN products p ON p.id=a.product_id'
-             . ($canSeeEmployeeDetails ? ' LEFT JOIN active_hardware_assignments active ON active.asset_id=a.id LEFT JOIN assignments assignment ON assignment.id=active.assignment_id LEFT JOIN employees e ON e.id=assignment.employee_record_id' : '') . '
-             WHERE a.asset_tag LIKE ? OR a.serial_number LIKE ? OR p.name LIKE ? OR a.location LIKE ?
-             ORDER BY a.asset_tag LIMIT 10',
-            [$like, $like, $like, $like]
-        )],
+        'Hardware' => ['hardware', fn(): array => $run($hardwareSearchSql,$hardwareSearchParams)],
         'Vendors' => ['vendors', fn(): array => $run(
             'SELECT id, vendor_name, contact_person, phone, email
              FROM vendors WHERE vendor_name LIKE ? OR contact_person LIKE ? OR phone LIKE ? OR email LIKE ? OR gstin LIKE ?
@@ -82,7 +83,7 @@ require __DIR__ . '/header.php';
                 <?php foreach ($rows as $row):
                     if ($group === 'Inventory') { $title=$row['name']; $detail=trim(($row['brand']??'') . ' ' . ($row['model']??'')) . ' · ' . $row['category_name']; $href='products.php?status=all&q=' . rawurlencode($query); }
                     elseif ($group === 'Employees') { $title=$row['full_name']; $detail=$row['employee_id'] . ' · ' . ($row['department'] ?: 'No department') . ' · ' . ($row['location'] ?: 'No location'); $href='employees.php?q=' . rawurlencode($query); }
-                    elseif ($group === 'Hardware') { $title=$row['asset_tag'] . ' · ' . $row['product_name']; $detail='Status: ' . $row['status'] . ($row['serial_number'] ? ' · Serial: ' . $row['serial_number'] : '') . ($row['assigned_employee'] ? ' · Assigned to ' . $row['assigned_employee'] : ''); $href=$row['assigned_employee_id'] && canViewResource('employees') ? 'employee.php?id=' . (int)$row['assigned_employee_id'] : (canViewResource('products') ? 'products.php?manage=' . (int)$row['product_id'] : 'search.php?q=' . rawurlencode($query)); }
+                    elseif ($group === 'Hardware') { $title=$row['asset_tag'] . ' · ' . $row['product_name']; $detail='Status: ' . $row['status'] . ' · Manufacturer serial: ' . ($row['serial_number'] ?: 'Pending') . ($row['internal_serial_number'] ? ' · Internal serial: ' . $row['internal_serial_number'] : '') . ($row['assigned_employee'] ? ' · Assigned to ' . $row['assigned_employee'] : ''); $href='asset-details.php?id=' . (int)$row['id']; }
                     elseif ($group === 'Vendors') { $title=$row['vendor_name']; $detail=implode(' · ', array_filter([$row['contact_person'], $row['phone'], $row['email']])); $href='vendors.php?status=all&q=' . rawurlencode($query); }
                     elseif ($group === 'Orders') { $title='Order #' . $row['id'] . ' · ' . $row['product_name']; $detail=($row['quantity'] < 0 ? abs((int)$row['quantity']) : $row['quantity']) . ' units · ' . ($row['status'] ?: 'No status') . ' · ' . ($row['vendor_name_snapshot'] ?: $row['vendor'] ?: 'No vendor'); $href='orders.php'; }
                     else { $title=$row['name']; $detail=(string)($row['description'] ?? ''); $href='categories.php'; }

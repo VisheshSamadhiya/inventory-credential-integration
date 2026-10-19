@@ -1,6 +1,10 @@
 <?php
 require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/credential_helpers.php';
+require_once __DIR__ . '/credential_totp_helpers.php';
+require_once __DIR__ . '/inventory_helpers.php';
+require_once __DIR__ . '/category_inventory_helpers.php';
+require_once __DIR__ . '/hardware_assignment_helpers.php';
 requirePermission('dashboard', 'view');
 $pageTitle = 'Dashboard';
 $pageHeadingInTemplate = true;
@@ -29,17 +33,52 @@ $canViewProducts = canViewResource('products');
 $canViewInventory = canViewResource('inventory');
 $canViewCategories = canViewResource('categories');
 $canViewHistory = canViewResource('history');
-$canViewCredentials = canViewResource('credentials');
+$canViewCredentials = canViewResource('credentials') && credentialTotpSessionVerified();
+$assignedQuantitySql = activeHardwareAssignmentQuantitySql('a');
+$validAssignedEmployeeSql = activeHardwareAssignmentEmployeeSql('a');
+$canViewCategoryInventory = $canViewInventory && $canViewProducts && canViewResource('assignments') && canViewResource('employees') && canViewResource('hardware');
 $products = $canViewProducts ? (int)$pdo->query('SELECT COUNT(*) FROM products WHERE active = 1')->fetchColumn() : 0;
 $categories = $canViewCategories ? (int)$pdo->query('SELECT COUNT(*) FROM categories WHERE active = 1')->fetchColumn() : 0;
 $stock = $canViewInventory ? (int)$pdo->query(
-    'SELECT COALESCE(SUM(COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0)),0)
+    'SELECT COALESCE(SUM(COALESCE((SELECT SUM(CASE WHEN t.transaction_type IN (\'in\',\'opening\') THEN ABS(t.quantity) WHEN t.transaction_type=\'out\' THEN -ABS(t.quantity) WHEN t.transaction_type=\'adjustment\' THEN t.quantity ELSE 0 END) FROM inventory_transactions t WHERE t.product_id=p.id),0)),0)
      FROM products p WHERE p.active = 1'
 )->fetchColumn() : 0;
 $lowStock = $canViewInventory ? (int)$pdo->query(
     'SELECT COUNT(*) FROM products p WHERE p.active = 1
-     AND COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) <= p.minimum_stock'
+     AND COALESCE((SELECT SUM(CASE WHEN t.transaction_type IN (\'in\',\'opening\') THEN ABS(t.quantity) WHEN t.transaction_type=\'out\' THEN -ABS(t.quantity) WHEN t.transaction_type=\'adjustment\' THEN t.quantity ELSE 0 END) FROM inventory_transactions t WHERE t.product_id=p.id),0) <= p.minimum_stock'
 )->fetchColumn() : 0;
+$categoryInventory = [];
+if ($canViewCategoryInventory) {
+    $categoryInventoryQuery = $pdo->prepare(
+        "SELECT c.id AS category_id, c.name AS category_name,
+                COALESCE(SUM(COALESCE(assigned.assigned_units, 0)), 0) AS active_units,
+                COALESCE(SUM(COALESCE(stock.available_units, 0)), 0) AS inactive_units
+         FROM categories c
+         LEFT JOIN products p ON p.category_id = c.id
+         LEFT JOIN (
+             SELECT product_id, SUM(CASE WHEN transaction_type IN ('in','opening') THEN ABS(quantity) WHEN transaction_type='out' THEN -ABS(quantity) WHEN transaction_type='adjustment' THEN quantity ELSE 0 END) AS available_units FROM inventory_transactions GROUP BY product_id
+         ) stock ON stock.product_id = p.id
+         LEFT JOIN (
+             SELECT a.product_id, SUM($assignedQuantitySql) AS assigned_units
+             FROM assignments a
+             WHERE a.status = 'assigned' AND a.returned_at IS NULL
+               AND $validAssignedEmployeeSql
+             GROUP BY a.product_id
+         ) assigned ON assigned.product_id = p.id
+         WHERE c.active = 1
+         GROUP BY c.id, c.name
+         ORDER BY c.name, c.id"
+    );
+    $categoryInventoryQuery->execute();
+    $categoryInventory = $categoryInventoryQuery->fetchAll();
+    foreach ($categoryInventory as &$categoryRow) {
+        $summary = categoryInventoryStockTotals((int)$categoryRow['active_units'], (int)$categoryRow['inactive_units']);
+        $categoryRow['active_units'] = $summary['active'];
+        $categoryRow['inactive_units'] = $summary['inactive'];
+        $categoryRow['total_units'] = $summary['total'];
+    }
+    unset($categoryRow);
+}
 $credentialStats = ['active' => 0, 'employees' => 0];
 if ($canViewCredentials) {
     [$credentialScope, $credentialParams] = credentialScopeSql('c');
@@ -48,7 +87,7 @@ if ($canViewCredentials) {
     $credentialStats = $credentialQuery->fetch() ?: $credentialStats;
 }
 $recent = $canViewHistory ? $pdo->query(
-    'SELECT t.transaction_at, t.transaction_type, t.quantity, t.new_quantity, t.reason,
+    'SELECT t.id, t.transaction_at, t.transaction_type, t.quantity, t.new_quantity, t.reason,
             p.name AS product_name, u.full_name
      FROM inventory_transactions t JOIN products p ON p.id=t.product_id
      LEFT JOIN users u ON u.id=t.created_by
@@ -75,19 +114,42 @@ require __DIR__ . '/header.php';
 </div>
 <div class="page-head dashboard-page-head"><div><div class="eyebrow"><?=htmlspecialchars($roleLabel)?> ACCESS</div><h1><?=htmlspecialchars($pageTitle)?></h1></div></div>
 <section class="dashboard-stat-section" aria-labelledby="inventory-stats-heading"><div class="dashboard-section-heading"><h2 id="inventory-stats-heading">Inventory</h2><p>Stock and catalog overview</p></div><div class="grid stats dashboard-stats">
-    <?php if($canViewProducts): ?><div class="card stat"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 7 8-4 8 4-8 4-8-4Z"></path><path d="M4 7v10l8 4 8-4V7M12 11v10"></path></svg></span><span>Active products</span><strong><?=$products?></strong></div><?php endif; ?>
-    <?php if($canViewCategories): ?><div class="card stat"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg></span><span>Categories</span><strong><?=$categories?></strong></div><?php endif; ?>
-    <?php if($canViewInventory): ?><div class="card stat"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 7h18M5 7l1 13h12l1-13M9 7V4h6v3"></path><path d="M9 11v5m6-5v5"></path></svg></span><span>Units in stock</span><strong><?=$stock?></strong></div><div class="card stat"><span class="stat-icon stat-icon-warning" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 10 18H2L12 3Z"></path><path d="M12 9v5m0 3h.01"></path></svg></span><span>Low or out of stock</span><strong><?=$lowStock?></strong></div><?php endif; ?>
+    <?php if($canViewCategoryInventory): ?><a class="card stat dashboard-stat-link" href="dashboard-details.php?view=active_products"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 7 8-4 8 4-8 4-8-4Z"></path><path d="M4 7v10l8 4 8-4V7M12 11v10"></path></svg></span><span>Active products</span><strong><?=$products?></strong><span class="visually-hidden">View active products</span></a><?php endif; ?>
+    <?php if($canViewCategoryInventory && $canViewCategories): ?><a class="card stat dashboard-stat-link" href="dashboard-details.php?view=categories"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg></span><span>Categories</span><strong><?=$categories?></strong><span class="visually-hidden">View categories and stock breakdown</span></a><?php endif; ?>
+    <?php if($canViewCategoryInventory): ?><a class="card stat dashboard-stat-link" href="dashboard-details.php?view=available_stock"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 7h18M5 7l1 13h12l1-13M9 7V4h6v3"></path><path d="M9 11v5m6-5v5"></path></svg></span><span>Available units</span><strong><?=$stock?></strong><span class="visually-hidden">View available inventory</span></a><a class="card stat dashboard-stat-link" href="dashboard-details.php?view=low_stock"><span class="stat-icon stat-icon-warning" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 10 18H2L12 3Z"></path><path d="M12 9v5m0 3h.01"></path></svg></span><span>Low or out of stock</span><strong><?=$lowStock?></strong><span class="visually-hidden">View low and out of stock products</span></a><?php endif; ?>
 </div></section>
-<?php if($canViewCredentials): ?><section class="dashboard-stat-section credential-stat-section" aria-labelledby="credential-stats-heading"><div class="dashboard-section-heading"><h2 id="credential-stats-heading">Credentials</h2><p>Authorized vault overview</p></div><div class="grid stats dashboard-stats credential-stats"><div class="card stat"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"></path></svg></span><span>Active credentials</span><strong><?= (int)$credentialStats['active_count']?></strong></div><div class="card stat"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"></circle><path d="M3 20v-1a6 6 0 0 1 12 0v1m2-10a3 3 0 1 0 0-6m1 9a5 5 0 0 1 3 5v1"></path></svg></span><span>Employees with credentials</span><strong><?= (int)$credentialStats['employee_count']?></strong></div></div></section><?php endif; ?>
+<?php if($canViewCategoryInventory): ?>
+<section class="dashboard-stat-section category-inventory-section" aria-labelledby="category-inventory-heading">
+    <div class="dashboard-section-heading"><h2 id="category-inventory-heading">Category-wise inventory</h2><p>Assigned assets and available stock</p></div>
+    <div class="category-inventory-grid">
+        <?php foreach($categoryInventory as $category): ?>
+        <div class="category-inventory-card">
+            <span class="category-inventory-card-heading">
+                <a href="<?=htmlspecialchars(categoryInventoryDetailsUrl((int)$category['category_id']), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>"><strong><?=htmlspecialchars((string)$category['category_name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></strong></a>
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m3 7 9-4 9 4-9 4-9-4Z"></path><path d="M3 7v10l9 4 9-4V7M12 11v10"></path></svg>
+            </span>
+            <span class="category-inventory-values">
+                <a href="dashboard-details.php?<?=http_build_query(['view'=>'category_active','category_id'=>(int)$category['category_id']])?>"><span>Active</span><strong class="category-active-value"><?=number_format($category['active_units'])?></strong></a>
+                <a href="dashboard-details.php?<?=http_build_query(['view'=>'category_inactive','category_id'=>(int)$category['category_id']])?>"><span>Inactive</span><strong><?=number_format($category['inactive_units'])?></strong></a>
+                <a href="dashboard-details.php?<?=http_build_query(['view'=>'category_total','category_id'=>(int)$category['category_id']])?>"><span>Total</span><strong class="category-total-value"><?=number_format($category['total_units'])?></strong></a>
+            </span>
+            <span class="visually-hidden">View <?=htmlspecialchars((string)$category['category_name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?> inventory</span>
+        </div>
+        <?php endforeach; ?>
+    </div>
+    <?php if(!$categoryInventory): ?><p class="muted">No categories have been configured yet.</p><?php endif; ?>
+</section>
+<?php endif; ?>
+<?php if($canViewCredentials): ?><section class="dashboard-stat-section credential-stat-section" aria-labelledby="credential-stats-heading"><div class="dashboard-section-heading"><h2 id="credential-stats-heading">Credentials</h2><p>Authorized vault overview</p></div><div class="grid stats dashboard-stats credential-stats"><a class="card stat dashboard-stat-link" href="credential-dashboard-details.php?view=active"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"></path></svg></span><span>Active credentials</span><strong><?= (int)$credentialStats['active_count']?></strong></a><a class="card stat dashboard-stat-link" href="credential-dashboard-details.php?view=employees"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"></circle><path d="M3 20v-1a6 6 0 0 1 12 0v1m2-10a3 3 0 1 0 0-6m1 9a5 5 0 0 1 3 5v1"></path></svg></span><span>Employees with credentials</span><strong><?= (int)$credentialStats['employee_count']?></strong></a></div></section><?php endif; ?>
 <div class="grid two">
     <?php if($canViewProducts): ?><section class="card"><h2>Inventory</h2><p>Find products, check stock, and record additions or removals.</p><a class="btn btn-glow" href="products.php">Open inventory</a></section><?php endif; ?>
     <?php if($canViewCategories): ?><section class="card"><h2>Categories</h2><p>Organize products with categories and sub-categories.</p><a class="btn" href="categories.php">Manage categories</a></section><?php endif; ?>
 </div>
 <?php if($canViewHistory): ?>
 <section class="card section-spaced"><h2>Recent stock changes</h2><div class="table-scroll"><table><thead><tr><th>Date</th><th>Product</th><th>Action</th><th>Qty</th><th>Stock now</th><th>Reason</th><th>User</th></tr></thead><tbody>
-<?php foreach($recent as $row): ?><tr><td><?=htmlspecialchars($row['transaction_at'])?></td><td><?=htmlspecialchars($row['product_name'])?></td><td><?=htmlspecialchars(['in'=>'Added','out'=>'Removed','opening'=>'Opening balance','ordered'=>'Ordered','adjustment'=>'Adjusted'][$row['transaction_type']]??$row['transaction_type'])?></td><td><?=$row['quantity']>0?'+':''?><?=$row['quantity']?></td><td><?=$row['new_quantity']?></td><td><?=htmlspecialchars($row['reason'])?></td><td><?=htmlspecialchars($row['full_name']??'System')?></td></tr><?php endforeach; ?>
+<?php foreach($recent as $row): $txLabel=match($row['transaction_type']){'in'=>(preg_match('/^Hardware returned|^Assignment return/i',(string)$row['reason'])?'Returned':'Received / Added'),'out'=>(str_starts_with((string)$row['reason'],'Replacement assignment')?'Replacement assignment':(str_starts_with((string)$row['reason'],'Assignment')?'Assigned':'Removed')),'opening'=>'Opening balance','ordered'=>'Ordered','adjustment'=>'Adjusted',default=>$row['transaction_type']}; $txUrl='transaction-details.php?id='.(int)$row['id']; ?><tr class="clickable-row" tabindex="0" role="link" aria-label="View transaction #<?=(int)$row['id']?> details" data-row-href="<?=$txUrl?>"><td><a class="row-detail-link" href="<?=$txUrl?>"><?=htmlspecialchars($row['transaction_at'])?></a></td><td><?=htmlspecialchars($row['product_name'])?></td><td><?=htmlspecialchars($txLabel)?></td><td><?=$row['quantity']>0?'+':''?><?=$row['quantity']?></td><td><?=$row['new_quantity']?></td><td><?=htmlspecialchars($row['reason'])?></td><td><?=htmlspecialchars($row['full_name']??'System')?></td></tr><?php endforeach; ?>
 <?php if(!$recent): ?><tr><td colspan="7" class="muted">No stock changes have been recorded.</td></tr><?php endif; ?>
 </tbody></table></div><a href="history.php">View full history</a></section>
 <?php endif; ?>
+<script>document.querySelectorAll('[data-row-href]').forEach(function(row){row.addEventListener('click',function(event){if(event.target.closest('a,button,input,select,textarea'))return;location.href=row.dataset.rowHref;});row.addEventListener('keydown',function(event){if(event.key==='Enter'||event.key===' '){event.preventDefault();location.href=row.dataset.rowHref;}});});</script>
 <?php require __DIR__ . '/footer.php'; ?>

@@ -1,5 +1,7 @@
 <?php
 require_once __DIR__ . '/inventory_helpers.php';
+require_once __DIR__ . '/asset_tag_helpers.php';
+require_once __DIR__ . '/employee_hardware_valuation.php';
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') requirePermission('assignments', 'view');
 $db = db();
 
@@ -32,10 +34,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && (array_key_exists('employee_search',
 
 $pageTitle = 'Assignments';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    requirePermission('assignments', 'add');
+    $postAction=(string)($_POST['action']??'assign');
+    requirePermission('assignments', $postAction==='assignment_return'?'edit':'add');
     requirePermission('inventory', 'stock_adjustment');
     verifyCsrf();
     try {
+        if ($postAction === 'assignment_return') {
+            $assignmentId=filter_var($_POST['assignment_id']??null,FILTER_VALIDATE_INT,['options'=>['min_range'=>1]]);
+            $returnQty=filter_var($_POST['return_quantity']??null,FILTER_VALIDATE_INT,['options'=>['min_range'=>1]]);
+            if(!$assignmentId||!$returnQty)throw new DomainException('Enter a valid return quantity.');
+            $db->beginTransaction();
+            $assignmentLock=$db->prepare("SELECT a.id,a.product_id,a.quantity,a.returned_quantity,a.assigned_to,a.employee_id,a.employee_record_id,p.name product_name FROM assignments a JOIN products p ON p.id=a.product_id WHERE a.id=? AND a.asset_id IS NULL AND a.status='assigned' FOR UPDATE");
+            $assignmentLock->execute([$assignmentId]);$assignment=$assignmentLock->fetch();
+            $remaining=$assignment?(int)$assignment['quantity']-(int)$assignment['returned_quantity']:0;
+            if(!$assignment||$returnQty>$remaining)throw new DomainException('Return quantity exceeds the remaining assigned units.');
+            $before=currentStock((int)$assignment['product_id']);$movement=calculateInventoryChange($before,'in',$returnQty);
+            $insert=$db->prepare("INSERT INTO inventory_transactions(product_id,transaction_type,quantity,previous_quantity,new_quantity,reason,notes,created_by,transaction_at) VALUES(?,'in',?,?,?,?,?,?,NOW())");
+            $reason='Assignment return → '.$assignment['assigned_to'].' ('.($assignment['employee_id']??'').')';
+            $insert->execute([$assignment['product_id'],$returnQty,$before,$movement['new_stock'],$reason,'Partial/full return from assignment #'.$assignmentId,currentUser()['id']]);
+            $transactionId=(int)$db->lastInsertId();
+            $cost=restoreAssignmentCost($db,(int)$assignmentId,(int)$returnQty);
+            if($cost!==null)$db->prepare('UPDATE inventory_transactions SET unit_price=?,total_price=? WHERE id=?')->execute([$cost['unit_price'],$cost['total_price'],$transactionId]);
+            if(!empty($assignment['employee_record_id'])){
+                recordEmployeeHardwareHistoryEvent($db,(int)$assignment['employee_record_id'],(int)$assignmentId,'returned',null,null,null,(int)currentUser()['id'],$transactionId,(int)$returnQty,$cost===null?0:(int)$returnQty,$cost['total_price']??null);
+            }
+            $returned=(int)$assignment['returned_quantity']+$returnQty;
+            $newStatus=$returned===(int)$assignment['quantity']?'returned':'assigned';
+            $db->prepare('UPDATE assignments SET returned_quantity=?,status=?,returned_at=IF(?="returned",NOW(),returned_at) WHERE id=?')->execute([$returned,$newStatus,$newStatus,$assignmentId]);
+            audit('assignment_return','assignment',$assignmentId,'Returned '.$returnQty.' '.$assignment['product_name'].'; assigned cost basis '.($cost['total_price']??'unavailable'));
+            recalculateInventoryMonths((int)$assignment['product_id']);
+            $db->commit();
+            setFlash('success','Returned stock was recorded.');
+            header('Location: assignments.php');exit;
+        }
         $employeePk = filter_var($_POST['employee_record_id'] ?? null, FILTER_VALIDATE_INT);
         $productId = filter_var($_POST['product_id'] ?? null, FILTER_VALIDATE_INT);
         $quantity = filter_var($_POST['quantity'] ?? null, FILTER_VALIDATE_INT);
@@ -51,12 +82,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $departmentText = trim((string)$employee['department']) !== '' ? trim((string)$employee['department']) : 'No department';
         $assignmentReason = 'Assignment → ' . $employee['full_name'] . ' (' . $employee['employee_id'] . '), ' . $departmentText;
 
-        $productQuery = $db->prepare('SELECT name FROM products WHERE id = ? AND active = 1 FOR UPDATE');
+        $productQuery = $db->prepare('SELECT name,serialized FROM products WHERE id = ? AND active = 1 FOR UPDATE');
         $productQuery->execute([$productId]);
-        $productName = $productQuery->fetchColumn();
-        if ($productName === false) throw new DomainException('Please select an active product.');
+        $product = $productQuery->fetch();
+        if (!$product) throw new DomainException('Please select an active product.');
+        $productName = $product['name'];
         $previousStock = currentStock((int)$productId);
         if ($quantity > $previousStock) throw new DomainException('There is not enough stock for this assignment.');
+        if ((bool)$product['serialized'] && $quantity > assetTagAvailableUnregisteredCapacity($db,(int)$productId)) {
+            throw new DomainException('This serialized product has registered or reserved asset tags. Assign those devices from the employee Hardware workflow, or choose only unregistered available units.');
+        }
         $movement = calculateInventoryChange($previousStock, 'out', $quantity);
         $newStock = $movement['new_stock'];
 
@@ -87,6 +122,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'Assignment #' . $assignmentId . ' to ' . $employee['full_name'] . ' (' . $employee['employee_id'] . ')',
             currentUser()['id'],
         ]);
+        $transactionId = (int)$db->lastInsertId();
+        $cost = allocateInventoryCost($db, (int)$productId, (int)$quantity, 'assignment', $assignmentId, $transactionId);
+        if ($cost !== null) {
+            $db->prepare('UPDATE inventory_transactions SET unit_price=?,total_price=? WHERE id=?')->execute([$cost['unit_price'],$cost['total_price'],$transactionId]);
+        }
+        recordEmployeeHardwareHistoryEvent($db,(int)$employeePk,$assignmentId,'assigned',null,null,null,(int)currentUser()['id'],$transactionId,(int)$quantity,$cost===null?0:(int)$quantity,$cost['total_price']??null);
         audit(
             'assignment',
             'assignment',
@@ -134,7 +175,7 @@ if (in_array($statusFilter, $allowedStatuses, true)) { $where[] = 'a.status = ?'
 if (preg_match('/^\d{4}-\d{2}-\d{2}$/D', $dateFrom)) { $where[] = 'a.assigned_at >= ?'; $params[] = $dateFrom . ' 00:00:00'; }
 if (preg_match('/^\d{4}-\d{2}-\d{2}$/D', $dateTo)) { $where[] = 'a.assigned_at <= ?'; $params[] = $dateTo . ' 23:59:59'; }
 $whereSql = $where ? ' WHERE ' . implode(' AND ', $where) : '';
-$assignmentSql = 'SELECT a.assigned_to, a.employee_id, a.department, a.quantity, a.assigned_at, a.status,
+$assignmentSql = 'SELECT a.id, a.asset_id, a.assigned_to, a.employee_id, a.department, a.quantity, a.returned_quantity, a.assigned_at, a.status,
                          p.name AS product_name
                   FROM assignments a JOIN products p ON p.id = a.product_id' . $whereSql .
                  ' ORDER BY a.assigned_at DESC, a.id DESC LIMIT 200';
@@ -189,9 +230,9 @@ require __DIR__ . '/header.php';
             <button class="btn" type="submit">Apply filters</button><a class="btn" href="assignments.php">Clear</a>
         </div>
     </form>
-    <div class="table-scroll"><table><thead><tr><th>Employee</th><th>Employee ID</th><th>Department</th><th>Product</th><th>Quantity</th><th>Date</th><th>Status</th></tr></thead><tbody>
-    <?php foreach ($assignments as $assignment): ?><tr><td><?=htmlspecialchars($assignment['assigned_to'])?></td><td><?=htmlspecialchars($assignment['employee_id']??'—')?></td><td><?=htmlspecialchars($assignment['department']??'—')?></td><td><?=htmlspecialchars($assignment['product_name'])?></td><td><?=$assignment['quantity']?></td><td><?=htmlspecialchars($assignment['assigned_at'])?></td><td><span class="badge"><?=htmlspecialchars(ucfirst($assignment['status']))?></span></td></tr><?php endforeach; ?>
-    <?php if (!$assignments): ?><tr><td colspan="7" class="muted"><?=($_GET?'No matching assignments found.':'No assignments found.')?></td></tr><?php endif; ?>
+    <div class="table-scroll"><table><thead><tr><th>Employee</th><th>Employee ID</th><th>Department</th><th>Product</th><th>Quantity</th><th>Date</th><th>Status</th><th>Action</th></tr></thead><tbody>
+    <?php foreach ($assignments as $assignment): ?><tr><td><?=htmlspecialchars($assignment['assigned_to'])?></td><td><?=htmlspecialchars($assignment['employee_id']??'—')?></td><td><?=htmlspecialchars($assignment['department']??'—')?></td><td><?=htmlspecialchars($assignment['product_name'])?></td><td><?=$assignment['quantity']-($assignment['returned_quantity']??0)?> remaining of <?=$assignment['quantity']?></td><td><?=htmlspecialchars($assignment['assigned_at'])?></td><td><span class="badge"><?=htmlspecialchars(ucfirst($assignment['status']))?></span></td><td><?php if($assignment['status']==='assigned'&&$assignment['asset_id']===null&&canPerform('assignments','edit')&&canPerform('inventory','stock_adjustment')): ?><form method="post" class="inline-actions"><input type="hidden" name="csrf" value="<?=htmlspecialchars(csrf())?>"><input type="hidden" name="action" value="assignment_return"><input type="hidden" name="assignment_id" value="<?=$assignment['id']?>"><input type="number" name="return_quantity" min="1" max="<?=$assignment['quantity']-($assignment['returned_quantity']??0)?>" value="1" aria-label="Return quantity" required><button class="btn" type="submit">Record return</button></form><?php else: ?>—<?php endif; ?></td></tr><?php endforeach; ?>
+    <?php if (!$assignments): ?><tr><td colspan="8" class="muted"><?=($_GET?'No matching assignments found.':'No assignments found.')?></td></tr><?php endif; ?>
     </tbody></table></div>
     <?php if (count($assignments)===200): ?><p class="muted">Showing the latest 200 matching assignments. Add search terms or filters to narrow results.</p><?php endif; ?>
 </section>

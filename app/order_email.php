@@ -23,6 +23,69 @@ function orderEmailEscape(mixed $value): string
     return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function orderEventEmail(string $eventType, array $order): array
+{
+    $events = [
+        'new_order' => ['subject' => 'New inventory order awaiting approval', 'heading' => 'New order submitted'],
+        'approved' => ['subject' => 'Inventory order approved', 'heading' => 'Order approved'],
+        'rejected' => ['subject' => 'Inventory order rejected', 'heading' => 'Order rejected'],
+    ];
+    if (!isset($events[$eventType])) throw new InvalidArgumentException('Unknown order notification event.');
+
+    $fields = [
+        'Order ID' => '#' . (string)($order['id'] ?? ''),
+        'Product' => (string)($order['product_name'] ?? ''),
+        'Quantity' => (string)($order['quantity'] ?? ''),
+    ];
+    if ($eventType === 'new_order') {
+        $fields += [
+            'Requester' => (string)($order['requester_name'] ?? ''),
+            'Reason' => (string)($order['reason'] ?? ''),
+            'Order date' => (string)($order['order_date'] ?? ''),
+            'Status' => 'Pending',
+        ];
+    } elseif ($eventType === 'approved') {
+        $fields += [
+            'Requester' => (string)($order['requester_name'] ?? ''),
+            'Status' => 'Approved',
+            'Approver' => (string)($order['actor_name'] ?? ''),
+            'Approved at' => (string)($order['event_at'] ?? ''),
+        ];
+    } else {
+        $fields += [
+            'Requester' => (string)($order['requester_name'] ?? ''),
+            'Status' => 'Rejected',
+            'Rejection reason' => (string)($order['rejection_reason'] ?? 'No reason provided'),
+            'Rejected by' => (string)($order['actor_name'] ?? ''),
+            'Rejected at' => (string)($order['event_at'] ?? ''),
+        ];
+    }
+
+    $htmlRows = '';
+    $textRows = [];
+    foreach ($fields as $label => $value) {
+        $displayValue = $value !== '' ? $value : '—';
+        $htmlRows .= '<tr><th align="left" style="padding:9px 12px;border-bottom:1px solid #E2E8F0;color:#64748B;font-size:13px">'
+            . orderEmailEscape($label) . '</th><td style="padding:9px 12px;border-bottom:1px solid #E2E8F0;color:#15243A;font-size:14px">'
+            . orderEmailEscape($displayValue) . '</td></tr>';
+        $textRows[] = $label . ': ' . $displayValue;
+    }
+    $heading = $events[$eventType]['heading'];
+    $html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+        . '<body style="margin:0;padding:24px 10px;background:#F5F7FB;font-family:Arial,Helvetica,sans-serif;color:#15243A">'
+        . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px">'
+        . '<tr><td style="padding:20px 24px;background:#15243A;color:#fff;font-size:20px;font-weight:bold">Inventory Manager</td></tr>'
+        . '<tr><td style="padding:24px"><h1 style="margin:0 0 16px;font-size:21px">' . orderEmailEscape($heading) . '</h1>'
+        . '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">' . $htmlRows . '</table>'
+        . '</td></tr><tr><td style="padding:16px 24px;background:#F8FAFC;color:#64748B;font-size:12px">Automatic order notification from Inventory Manager.</td></tr>'
+        . '</table></body></html>';
+    return [
+        'subject' => 'Inventory Manager — ' . $events[$eventType]['subject'],
+        'html' => $html,
+        'text' => "Inventory Manager — {$heading}\n\n" . implode("\n", $textRows) . "\n",
+    ];
+}
+
 function orderEmailViewUrl(string $appUrl, bool $allowInternal = false): ?string
 {
     $url = trim($appUrl);
@@ -93,7 +156,16 @@ function deliverOrderReport(array $recipients, callable $send): array
 function orderEmailRecipients(string $configured): array
 {
     $emails = array_map('trim', explode(',', $configured));
-    return array_values(array_unique(array_filter($emails, static fn(string $email): bool => filter_var($email, FILTER_VALIDATE_EMAIL) !== false)));
+    $recipients = [];
+    $seen = [];
+    foreach ($emails as $email) {
+        if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) continue;
+        $key = strtolower($email);
+        if (isset($seen[$key])) continue;
+        $seen[$key] = true;
+        $recipients[] = $email;
+    }
+    return $recipients;
 }
 
 /** Execute either report command. The preview path never invokes the delivery callback. */

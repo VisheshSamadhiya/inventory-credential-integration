@@ -69,6 +69,8 @@ function permissionCatalog(): array {
         'vendors' => ['label' => 'Vendors', 'permissions' => ['view', 'add', 'edit', 'delete', 'status']],
         'history' => ['label' => 'History', 'permissions' => ['view']],
         'search' => ['label' => 'Global search', 'permissions' => ['view']],
+        'inventory_audit' => ['label' => 'Inventory Audit', 'permissions' => ['view', 'export']],
+        'credential_audit' => ['label' => 'Credential Audit', 'permissions' => ['view', 'export']],
     ];
 }
 
@@ -88,6 +90,7 @@ function permissionLabels(): array {
         'order_rejection' => 'Order rejection', 'order_receive' => 'Receive order',
         'create' => 'Add credentials', 'reveal' => 'Reveal passwords', 'audit' => 'Credential access logs',
         'manage_access' => 'Manage department access',
+        'export' => 'Export audit records',
     ];
 }
 
@@ -178,7 +181,9 @@ function canPerform(string $resource, string $operation): bool {
     }
     if (!isset($known[$resource]) || !in_array($operation, $known[$resource]['permissions'], true)) return false;
     if (isset(systemPermissionCatalog()[$resource])) return canAdmin();
-    return (bool)(effectivePermissionMatrix()[$resource][$operation] ?? false);
+    $matrix = effectivePermissionMatrix();
+    if (in_array($resource, ['credentials', 'credential_audit'], true) && empty($matrix['credentials']['view'])) return false;
+    return (bool)($matrix[$resource][$operation] ?? false);
 }
 
 function canViewResource(string $resource): bool {
@@ -190,6 +195,10 @@ function requirePermission(string $resource, string $operation): void {
     if (!canPerform($resource, $operation)) {
         http_response_code(403);
         exit('403 Forbidden');
+    }
+    if ($resource === 'credentials' || $resource === 'credential_audit') {
+        require_once __DIR__ . '/credential_totp_helpers.php';
+        requireCredentialTwoFactor();
     }
 }
 
@@ -206,24 +215,38 @@ function assertActiveAdminRetained(array $activeAdminIds, int $targetUserId, str
 }
 
 function csrf(): string {
-    if (empty($_SESSION['csrf'])) {
+    if (!isset($_SESSION['csrf']) || !is_string($_SESSION['csrf']) || $_SESSION['csrf'] === '') {
         $_SESSION['csrf'] = bin2hex(random_bytes(32));
     }
     return $_SESSION['csrf'];
 }
 
+function csrfTokenMatches(mixed $submitted): bool {
+    $expected = $_SESSION['csrf'] ?? null;
+    return is_string($expected) && $expected !== ''
+        && is_string($submitted) && $submitted !== ''
+        && hash_equals($expected, $submitted);
+}
+
 function verifyCsrf(): void {
-    if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) {
+    if (!csrfTokenMatches($_POST['csrf'] ?? null)) {
         http_response_code(419);
+        header('HTTP/1.1 419 Page Expired', true, 419);
         exit('Invalid CSRF token');
     }
 }
 
+function trustedRequestIpAddress(): ?string {
+    $candidate = $_SERVER['REMOTE_ADDR'] ?? null;
+    if (!is_string($candidate) || filter_var($candidate, FILTER_VALIDATE_IP) === false) return null;
+    return $candidate;
+}
+
 function audit(string $action, ?string $entityType = null, ?int $entityId = null, ?string $details = null): void {
     $stmt = db()->prepare(
-        'INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?)'
+        'INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, ip_address) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    $stmt->execute([currentUser()['id'] ?? null, $action, $entityType, $entityId, $details]);
+    $stmt->execute([currentUser()['id'] ?? null, $action, $entityType, $entityId, $details, trustedRequestIpAddress()]);
 }
 
 function setFlash(string $type, string $message): void {

@@ -11,12 +11,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $name = trim($_POST['full_name'] ?? '');
     $username = trim($_POST['username'] ?? '');
     $password = $_POST['password'] ?? '';
-    if ($name === '' || $username === '' || strlen($password) < 8) {
-        $error = 'Name, username and a password of at least 8 characters are required.';
+    if ($name === '' || strlen($name)>150 || $username === '' || strlen($username)>100 || strlen($password) < 12) {
+        $error = 'Enter a valid name, username and a password of at least 12 characters.';
     } else {
-        $stmt = db()->prepare('INSERT INTO users (full_name, username, password_hash, role) VALUES (?, ?, ?, "admin")');
-        $stmt->execute([$name, $username, password_hash($password, PASSWORD_DEFAULT)]);
-        header('Location: login.php'); exit;
+        $pdo = db();
+        $lockName = hash('sha256', 'inventory-bootstrap:' . $pdo->query('SELECT DATABASE()')->fetchColumn());
+        $lock = $pdo->prepare('SELECT GET_LOCK(?,10)');
+        $lock->execute([$lockName]);
+        $locked = (int)$lock->fetchColumn() === 1;
+        try {
+            if (!$locked) throw new DomainException('Setup is busy. Please try again.');
+            $pdo->beginTransaction();
+            if ((int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn() > 0) throw new DomainException('Initial setup is already complete. Sign in to continue.');
+            $stmt = $pdo->prepare('INSERT INTO users (full_name, username, password_hash, role) VALUES (?, ?, ?, "admin")');
+            $stmt->execute([$name, $username, password_hash($password, PASSWORD_DEFAULT)]);
+            audit('initial_admin_created', 'user', (int)$pdo->lastInsertId(), $username);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            $error = $exception instanceof DomainException ? $exception->getMessage() : 'Unable to complete setup.';
+        } finally {
+            if ($locked) $pdo->prepare('SELECT RELEASE_LOCK(?)')->execute([$lockName]);
+        }
+        if ($error === '') { header('Location: login.php'); exit; }
     }
 }
 ?>
@@ -29,6 +46,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <input type="hidden" name="csrf" value="<?=htmlspecialchars(csrf())?>">
 <label>Full name</label><input name="full_name" required>
 <label>Username</label><input name="username" required>
-<label>Password</label><input type="password" name="password" minlength="8" required>
+<label>Password</label><input type="password" name="password" minlength="12" required>
 <button class="btn btn-glow">Create Admin</button>
 </form></div></body></html>

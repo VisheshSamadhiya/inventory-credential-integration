@@ -7,7 +7,7 @@
     const details = Array.from(picker.querySelectorAll('[data-vendor-detail]'));
     if (!picker.id) picker.id = 'vendor-picker-' + Array.from(document.querySelectorAll('[data-vendor-picker]')).indexOf(picker);
     let activeIndex = -1;
-    let selectedName = '';
+    let selectedName = hidden.value && search.value ? search.value : '';
 
     function visibleOptions() { return options.filter(function (option) { return !option.hidden; }); }
     function openList() { list.hidden = false; search.setAttribute('aria-expanded', 'true'); }
@@ -19,6 +19,14 @@
       hidden.value = vendor.id;
       hidden.dispatchEvent(new Event('change', { bubbles: true }));
       details.forEach(function (field) { field.value = vendor[field.dataset.vendorDetail] || ''; });
+      search.setCustomValidity('');
+      closeList();
+    }
+    function clearSelection() {
+      search.value = '';
+      selectedName = '';
+      hidden.value = '';
+      details.forEach(function (field) { field.value = ''; });
       search.setCustomValidity('');
       closeList();
     }
@@ -68,11 +76,25 @@
       option.addEventListener('click', function () { select(option); search.focus(); });
       option.addEventListener('mouseenter', function () { mark(visibleOptions().indexOf(option)); });
     });
+    picker.addEventListener('vendor-picker:select', function (event) {
+      const vendorId = Number(event.detail && event.detail.vendorId);
+      const option = options.find(function (candidate) {
+        try { return Number(JSON.parse(candidate.dataset.vendor).id) === vendorId; } catch (_) { return false; }
+      });
+      if (option) select(option); else clearSelection();
+    });
     picker.closest('form')?.addEventListener('submit', function (event) {
       const valid = !search.required || hidden.value !== '';
       search.setCustomValidity(valid ? '' : 'Choose an active vendor from the suggestions.');
       if (!valid) { event.preventDefault(); search.reportValidity(); search.focus(); }
     });
     document.addEventListener('pointerdown', function (event) { if (!picker.contains(event.target)) closeList(); });
+    const initialVendorId = Number(picker.dataset.initialVendorId || 0);
+    if (initialVendorId > 0) {
+      const initialOption = options.find(function (option) {
+        try { return Number(JSON.parse(option.dataset.vendor).id) === initialVendorId; } catch (_) { return false; }
+      });
+      if (initialOption) select(initialOption);
+    }
   });
 })();

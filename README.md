@@ -1,5 +1,9 @@
 # Inventory Manager
 
+## Production ZIP
+
+For standalone Ubuntu/Apache and Plesk deployment without Docker, use `inventory-credential-manager-production.zip`. It contains the current `app/`, the consolidated empty-database schema, ordered upgrade SQL, Composer manifests, and deployment documentation. Start with [Ubuntu installation](docs/INSTALL-STANDALONE-UBUNTU.md) or [Plesk installation](docs/INSTALL-PLESK.md). Docker remains available for development only. The `vendor/` libraries are installed from the committed Composer lock file on the target host.
+
 A server-rendered inventory application built with PHP 8.3, Apache, MariaDB 11.8, and Docker Compose. It manages products, categories, quantity-based stock, employees, assignments, stock history, and administrator-visible audit logs.
 
 ## Architecture
@@ -72,6 +76,9 @@ The existing migrations are:
 - `20261012_add_vendor_management.sql`: creates vendor master records and adds nullable vendor links and order-time snapshots while preserving legacy vendor text.
 - `20261013_add_admin_managed_rbac.sql`: adds role defaults and per-user permission profiles, then seeds the existing Editor and Viewer access policy. It does not update existing users or business records.
 - `20261013_add_user_auth_version.sql`: adds an additive account security version used to invalidate existing PHP file sessions after password, username, role, or status changes. Existing users and password hashes are unchanged.
+- `20261015_add_order_email_outbox.sql`: adds optional login-account notification emails, order form idempotency keys, and a database-backed outbox without changing existing orders or inventory history.
+- `20261019_add_credential_totp.sql`: adds encrypted per-user credential-only TOTP enrollment, enforcement and rate-limit state. It does not change login behavior or credential records.
+- `20261019_add_employee_hardware_valuation.sql`: adds asset cost-layer and assignment-event references used by employee hardware valuation. It only backfills values supported by existing asset costs or FIFO allocation records; unsupported historical costs remain unavailable.
 
 Apply the vendor migration to an existing Docker MariaDB database with:
 
@@ -80,6 +87,29 @@ docker compose exec -T db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MA
 ```
 
 There is no automatic migration runner or migration ledger. Do not apply the enum migration repeatedly without checking the current column definition. The vendor migration is repeatable. No migration should delete historical transactions, assignments, employees, or users.
+
+For an existing installation that enables Credential 2FA, apply the reviewed additive migration after a verified backup:
+
+```sh
+docker compose exec -T db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"' < database/migrations/20261019_add_credential_totp.sql
+```
+
+The migration is idempotent. Setup secrets use the existing `CREDENTIAL_ENCRYPTION_KEY`; the standalone deployment must keep that key in its server-side secret configuration.
+
+For Employee Details → Hardware valuation, first verify that the inventory cost-layer and reconciliation migrations (`20261016_add_inventory_cost_layers_and_receipts.sql` and `20261018_add_inventory_cost_reconciliation.sql`) have been applied. Back up the database, review the employee hardware valuation migration, and apply it explicitly:
+
+```sh
+docker compose exec -T db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"' < database/migrations/20261019_add_employee_hardware_valuation.sql
+```
+
+This migration adds nullable source/event references and supported historical event snapshots. It does not create receipt records, infer costs from current product prices, or alter stock quantities. Historical values without a recorded asset cost or FIFO assignment allocation remain unavailable.
+
+After rebuilding the local app image, run the credential TOTP integration test against the configured MariaDB. It uses a uniquely named temporary user and removes its user, policy, TOTP row and audit fixture when complete:
+
+```sh
+docker compose build app
+docker compose run --rm --no-deps -T app php < tests/credential_totp_test.php
+```
 
 ## Roles and permissions
 
@@ -145,7 +175,13 @@ docker compose build app
 docker compose ps
 ```
 
-The PHP test runner covers stock arithmetic, negative-stock protection, every catalog capability across Admin, Editor and Viewer defaults and Full/Custom/No Access modes, unknown-permission denial, CSRF acceptance/rejection, flash consumption, order email rendering, and preview/send command behavior. It does not replace authenticated database integration, concurrency, or browser tests. Do not run write-workflow tests against a database containing real development or production data; use a separately provisioned test database and test credentials.
+The PHP test runner covers stock arithmetic, negative-stock protection, every catalog capability across Admin, Editor and Viewer defaults and Full/Custom/No Access modes, unknown-permission denial, CSRF acceptance/rejection, flash consumption, order email rendering, and preview/send command behavior. The separate `tests/order_email_outbox_integration_test.php` exercises database deduplication and worker retry behavior. It does not replace authenticated browser tests. Do not run write-workflow tests against a database containing real development or production data; use a separately provisioned test database and test credentials.
+
+Run the outbox integration test against that isolated database after starting the worker service:
+
+```sh
+docker compose exec -T order-email-worker sh -lc 'APP_ROOT=/var/www/html php' < tests/order_email_outbox_integration_test.php
+```
 
 ## Health check
 
@@ -233,11 +269,37 @@ The `order-reminders` service checks for Pending orders every six hours. It send
 
 Configure `ADMIN_EMAILS` as a comma-separated list and set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` in `.env`. SMTP uses authenticated STARTTLS with certificate verification enabled. Keep real credentials out of `.env.example` and source control.
 
+Compose containers keep the environment they received at creation time. After changing SMTP values, recreate the mail services so the worker and reminder service use the same credentials as the app:
+
+```sh
+docker compose up -d --force-recreate app order-reminders order-email-worker
+```
+
 To verify SMTP without querying orders or writing reminder history, run:
 
 ```sh
 docker compose exec order-reminders php /var/www/html/bin/send_order_reminders.php --test-email recipient@example.com
 ```
+
+## Automatic order notifications
+
+`order-email-worker` polls the database-backed email outbox every 30 seconds. New orders enqueue one message for each valid `ADMIN_EMAILS` address. Approvals and rejections enqueue messages for each valid admin and the login account that created the order; if the requester email is missing, admin messages are still queued. Set that account's **Notification email** in Users and permissions; existing accounts have no address until an administrator adds one. Recipient addresses are deduplicated case-insensitively. Messages include the requester and action details, and rejection messages include the reason. Email is queued in the order/status transaction and sent only after commit. SMTP failures are retried with bounded backoff; after six attempts the row is marked failed. Duplicate order form submissions and repeated status updates do not create duplicate notifications. Existing orders are not backfilled.
+
+For an existing installation, apply the additive migration, then rebuild and recreate the app, reminder and worker services. This does not recreate MariaDB or its named volume:
+
+```sh
+docker compose exec -T db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"' < database/migrations/20261015_add_order_email_outbox.sql
+docker compose build app order-reminders order-email-worker
+docker compose up -d --force-recreate app order-reminders order-email-worker
+```
+
+To verify outbox rendering, deduplication, simulated SMTP failure/retry, and all three event types against a test database, run:
+
+```sh
+docker compose exec -T order-email-worker sh -lc 'APP_ROOT=/var/www/html php' < tests/order_email_outbox_integration_test.php
+```
+
+For a live delivery check, create an order in Inventory and verify the admins in `ADMIN_EMAILS` receive the Pending message. Use separate orders for status tests: confirm one as an authorized approver and verify the requester account's email; reject another as an authorized user and verify the rejection reason and actor. Check `docker compose logs --tail=100 order-email-worker` for delivery or retry status. Inspect persistent delivery state with `docker compose exec db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE" -e "SELECT id,event_type,status,attempts,sent_at,last_error FROM order_email_outbox ORDER BY id DESC LIMIT 20"'`. Missing or invalid requester emails are skipped safely. The SMTP test command above verifies Gmail connectivity from the reminder service, while a live order verifies delivery from the outbox worker.
 
 ## Order status email reports
 
@@ -288,3 +350,28 @@ Send one real report to every valid recipient in `ADMIN_EMAILS`:
 ```sh
 docker compose exec app php /var/www/html/bin/send_order_reminders.php --send-report
 ```
+
+## Automatic asset tag generation
+
+Hardware Assets provides single and bulk registration for serialized products. Bulk requests reserve a prefix range and available or existing assigned quantity, then a worker creates individual `inventory_assets` rows in batches. The batch size defaults to 250 and can be set from 1 to 5,000 with `ASSET_TAG_BATCH_SIZE`. Generated serial numbers remain blank; asset tag reservations are retained in `asset_tag_registry`, including when an asset or job is later retired. Jobs are idempotent by request key and can be retried without duplicating committed batches. Reconciliation tags remain reserved until an authorized user associates each tag with a specific active employee assignment. Neither generation nor reconciliation writes inventory transactions.
+
+For an existing database, apply the additive migration before deploying the page and worker. It seeds the durable registry from existing asset tags and adds indexes/metadata without changing product quantities, assignments, or transaction history. It does not recreate or remove the database volume:
+
+```sh
+docker compose exec -T db sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"' < database/migrations/20261016_add_asset_tag_generator.sql
+docker compose build app asset-tag-worker
+docker compose up -d --force-recreate app asset-tag-worker
+```
+
+Verify the worker and additive schema:
+
+```sh
+docker compose ps db app asset-tag-worker
+docker compose exec -T asset-tag-worker php /var/www/html/bin/process_asset_tag_jobs.php --once
+docker compose exec -T db sh -lc 'mariadb -N -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE" -e "SHOW TABLES; SHOW COLUMNS FROM inventory_assets; SELECT COUNT(*) AS registered_tag_reservations FROM asset_tag_registry; SELECT id,status,next_offset,quantity FROM asset_tag_jobs ORDER BY id DESC LIMIT 10;"'
+php tests/run.php
+```
+
+The one-batch worker command is safe when the queue is empty and processes at most one batch otherwise. To run the MariaDB duplicate, retry, concurrency, reconciliation, and stock-consistency checks, use a disposable database whose name ends in `_asset_tag_test`, apply the normal schema and migrations there, then set `ASSET_TAG_INTEGRATION_TESTS=1` and the usual `DB_*` variables before running `php tests/asset_tag_integration_test.php`. The integration test refuses any other database name and leaves its fixtures in that disposable database for inspection.
+
+The `Hardware Assets` page includes search by tag, serial number, product, employee and location, streamed CSV export, XLSX export (up to 50,000 matching rows), and printable label sheets of 1,000 tags per page. Role permissions follow the existing `hardware` module: view for search/export, add for registration, edit for job retry, and hardware assignment plus employee view for reconciliation.

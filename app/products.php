@@ -1,5 +1,8 @@
 <?php
 require_once __DIR__ . '/inventory_helpers.php';
+require_once __DIR__ . '/asset_tag_helpers.php';
+require_once __DIR__ . '/product_selection.php';
+require_once __DIR__ . '/purchase_order_helpers.php';
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') requirePermission('products', 'view');
 
 $pageTitle = 'Inventory';
@@ -8,7 +11,9 @@ $canAddProduct = canPerform('products', 'add');
 $canEditProduct = canPerform('products', 'edit');
 $canChangeProductStatus = canPerform('products', 'status');
 $canAdjustStock = canPerform('inventory', 'stock_adjustment');
-$activeVendors = canPerform('orders', 'add') && canViewResource('vendors') ? $pdo->query('SELECT id,vendor_name,contact_person,phone,email,address,gstin FROM vendors WHERE active=1 ORDER BY vendor_name')->fetchAll() : [];
+$canReceiveOrder = canPerform('orders','order_receive');
+$canViewVendors = canViewResource('vendors');
+$activeVendors = ($canAdjustStock || canPerform('orders', 'add') || $canReceiveOrder) && $canViewVendors ? $pdo->query('SELECT id,vendor_name,contact_person,phone,email,address,gstin FROM vendors WHERE active=1 ORDER BY vendor_name')->fetchAll() : [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = (string)($_POST['action'] ?? '');
@@ -17,7 +22,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'toggle' => ['products', 'status'],
         'create' => ['products', 'add'],
         'update' => ['products', 'edit'],
-        'stock' => $stockOperation === 'ordered' ? ['orders', 'add'] : ['inventory', 'stock_adjustment'],
+        'stock' => $stockOperation === 'ordered' ? ['orders', 'add'] : ($stockOperation==='receive'&&filter_var($_POST['order_id']??null,FILTER_VALIDATE_INT,['options'=>['min_range'=>1]])?['orders','order_receive']:['inventory','stock_adjustment']),
         default => ['products', 'edit'],
     };
     requirePermission($resource, $permissionOperation);
@@ -34,7 +39,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $quantity = (int)$quantityInput;
             $reason = trim((string)($_POST['reason'] ?? ''));
-            if (!in_array($operation, ['in', 'out', 'ordered'], true) || $quantity < 1 || !in_array($reason, ['Requested', 'New', 'Replacement', 'Purchase'], true)) {
+            $isReceipt = $operation === 'receive';
+            if (!in_array($operation, ['out', 'ordered', 'receive'], true) || $quantity < 1 || $reason === '') {
                 throw new DomainException('Choose an operation and reason, and enter a positive quantity.');
             }
 
@@ -43,6 +49,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $vendor = null;
             $vendorRecord = null;
             $status = null;
+            $receivedAt = null;
+            $referenceNumber = trim((string)($_POST['reference_number'] ?? ''));
+            $notes = trim((string)($_POST['notes'] ?? ''));
+            $orderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1]]) ?: null;
+            $requestKey = trim((string)($_POST['request_key'] ?? ''));
+            if (!preg_match('/^[a-f0-9]{64}$/iD', $requestKey)) throw new DomainException('Refresh the stock form and submit the change again.');
+            if ($isReceipt) {
+                if (!in_array($reason, ['Requested', 'New', 'Replacement'], true)) throw new DomainException('Choose a receipt reason.');
+                $price = calculateTransactionPrice($quantity, trim((string)($_POST['unit_price'] ?? '')));
+                $unitPrice = $price['unit_price'];
+                $totalPrice = $price['total_price'];
+                $dateInput = trim((string)($_POST['received_date'] ?? ''));
+                $receivedDate = DateTimeImmutable::createFromFormat('!Y-m-d', $dateInput);
+                if (!$receivedDate || $receivedDate->format('Y-m-d') !== $dateInput) throw new DomainException('Enter a valid received date.');
+                if ($dateInput > date('Y-m-d')) throw new DomainException('Received date cannot be in the future.');
+                $receivedAt = $dateInput === date('Y-m-d') ? date('Y-m-d H:i:s') : $dateInput . ' 12:00:00';
+                if (strlen($referenceNumber) > 180 || strlen($notes) > 2000) throw new DomainException('Reference or notes are too long.');
+            }
             if ($operation === 'ordered') {
                 $priceInput = trim((string)($_POST['unit_price'] ?? ''));
                 $price = calculateTransactionPrice($quantity, $priceInput);
@@ -52,23 +76,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->beginTransaction();
-            if ($operation === 'ordered') { $vendorRecord = activeVendorForOrder($pdo, $_POST['vendor_id'] ?? null); $vendor = $vendorRecord['vendor_name']; }
+            if ($operation === 'ordered' || $isReceipt) { $vendorRecord = activeVendorForOrder($pdo, $_POST['vendor_id'] ?? null); $vendor = $vendorRecord['vendor_name']; }
             $lock = $pdo->prepare('SELECT id FROM products WHERE id = ? AND active = 1 FOR UPDATE');
             $lock->execute([$productId]);
             if (!$lock->fetchColumn()) {
                 throw new DomainException('Product is unavailable.');
             }
+            $duplicate = $pdo->prepare('SELECT id FROM inventory_transactions WHERE request_key=? LIMIT 1 FOR UPDATE');
+            $duplicate->execute([$requestKey]);
+            if ($duplicate->fetchColumn()) {
+                $pdo->commit();
+                setFlash('success', $isReceipt ? 'This stock receipt was already saved.' : 'This stock change was already saved.');
+                    header('Location: ' . $redirect . '&operation=' . rawurlencode($operation));
+                exit;
+            }
+            if ($isReceipt && $orderId !== null) {
+                $orderQuery = $pdo->prepare("SELECT id,product_id,quantity,status,vendor_id,unit_price,COALESCE(vendor_name_snapshot,vendor) vendor_name FROM inventory_transactions WHERE id=? AND transaction_type='ordered' FOR UPDATE");
+                $orderQuery->execute([$orderId]);
+                $order = $orderQuery->fetch();
+                $receivedQuery = $pdo->prepare("SELECT COALESCE(SUM(quantity),0) FROM inventory_transactions WHERE related_order_id=? AND transaction_type='in'");
+                $receivedQuery->execute([$orderId]);
+                $receiptState = validatePurchaseOrderReceipt($order ?: null, $productId, $quantity, $unitPrice, $vendorRecord, (int)$receivedQuery->fetchColumn());
+                $remainingOrderQty = $receiptState['remaining_quantity'];
+            }
             $previous = currentStock($productId);
-            $movement = calculateInventoryChange($previous, $operation, $quantity);
+            $movementType = $isReceipt ? 'in' : $operation;
+            $movement = calculateInventoryChange($previous, $movementType, $quantity);
             $delta = $movement['delta'];
             $current = $movement['new_stock'];
+            assertAssetTagStockChangeAllowed($pdo, $productId, $delta, $current);
 
             $stmt = $pdo->prepare(
                 'INSERT INTO inventory_transactions
-                    (product_id, transaction_type, quantity, previous_quantity, new_quantity, reason, unit_price, total_price, vendor, vendor_id, vendor_name_snapshot, vendor_contact_snapshot, vendor_phone_snapshot, vendor_email_snapshot, vendor_address_snapshot, vendor_gstin_snapshot, status, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)'
+                    (product_id, transaction_type, quantity, previous_quantity, new_quantity, reason, unit_price, total_price, order_reason, vendor, vendor_id, vendor_name_snapshot, vendor_contact_snapshot, vendor_phone_snapshot, vendor_email_snapshot, vendor_address_snapshot, vendor_gstin_snapshot, status, related_order_id, notes, reference_number, created_by, transaction_at, request_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW()), ?)'
             );
-            $stmt->execute([$productId, $operation, $delta, $previous, $current, $reason, $unitPrice, $totalPrice, $vendor, $vendorRecord['id']??null, $vendorRecord['vendor_name']??null, $vendorRecord['contact_person']??null, $vendorRecord['phone']??null, $vendorRecord['email']??null, $vendorRecord['address']??null, $vendorRecord['gstin']??null, $status, currentUser()['id']]);
+            $transactionType = $isReceipt ? 'in' : $operation;
+            $savedStatus = $isReceipt ? 'Received' : $status;
+            $stmt->execute([$productId, $transactionType, $delta, $previous, $current, $reason, $unitPrice, $totalPrice, $isReceipt ? $reason : null, $vendor, $vendorRecord['id']??null, $vendorRecord['vendor_name']??null, $vendorRecord['contact_person']??null, $vendorRecord['phone']??null, $vendorRecord['email']??null, $vendorRecord['address']??null, $vendorRecord['gstin']??null, $savedStatus, $isReceipt ? $orderId : null, $notes !== '' ? $notes : null, $isReceipt && $referenceNumber !== '' ? $referenceNumber : null, currentUser()['id'], $receivedAt, $requestKey]);
+            // Allocation inserts have their own IDs; retain the movement ID.
+            $transactionId = (int)$pdo->lastInsertId();
+            if ($isReceipt) {
+                createInventoryCostLayer($pdo, $productId, $transactionId, $quantity, $unitPrice);
+                // Approval remains Confirmed; receipt completion is derived
+                // independently from the linked receipt quantities.
+            } elseif ($operation === 'out') {
+                $cost = allocateInventoryCost($pdo, $productId, $quantity, 'stock_removal', null, $transactionId);
+                if ($cost !== null) $pdo->prepare('UPDATE inventory_transactions SET unit_price=?,total_price=? WHERE id=?')->execute([$cost['unit_price'],$cost['total_price'],$transactionId]);
+            }
             audit(
                 'stock_update',
                 'product',
@@ -77,8 +132,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             recalculateInventoryMonths($productId);
             $pdo->commit();
-            setFlash('success', 'Stock updated successfully.');
-            header('Location: ' . $redirect);
+            setFlash('success', $isReceipt ? 'Stock receipt saved successfully.' : 'Stock updated successfully.');
+            header('Location: ' . $redirect . '&operation=' . rawurlencode($operation));
             exit;
         }
 
@@ -194,6 +249,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         setFlash('error', $exception->getMessage());
     } catch (PDOException $exception) {
         if ($pdo->inTransaction()) $pdo->rollBack();
+        if (($action ?? '') === 'stock' && isset($requestKey) && preg_match('/^[a-f0-9]{64}$/iD', $requestKey)) {
+            $duplicate = $pdo->prepare('SELECT id FROM inventory_transactions WHERE request_key=? LIMIT 1');
+            $duplicate->execute([$requestKey]);
+            if ($duplicate->fetchColumn()) {
+                setFlash('success', ($isReceipt ?? false) ? 'This stock receipt was already saved.' : 'This stock change was already saved.');
+                header('Location: ' . $redirect . '&operation=' . rawurlencode((string)($_POST['operation'] ?? 'receive')));
+                exit;
+            }
+        }
         error_log('Inventory product operation failed: ' . $exception->getMessage());
         setFlash('error', (int)($exception->errorInfo[1] ?? 0) === 1062
             ? 'A product with those details already exists.'
@@ -203,120 +267,150 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         error_log('Inventory operation failed: ' . $exception->getMessage());
         setFlash('error', 'Unable to update stock. Please try again.');
     }
+    if ($action === 'stock') {
+        $failedOperation = (string)($_POST['operation'] ?? '');
+        $failedOrderId = filter_var($_POST['order_id'] ?? null, FILTER_VALIDATE_INT, ['options'=>['min_range'=>1]]);
+        if ($failedOperation === 'receive' && $failedOrderId) {
+            $redirect = 'products.php?receive_order=' . (int)$failedOrderId;
+        } elseif (in_array($failedOperation, ['receive', 'ordered', 'out'], true)) {
+            $redirect .= '&operation=' . rawurlencode($failedOperation);
+        }
+    }
     header('Location: ' . $redirect);
     exit;
 }
 
-$search = trim((string)($_GET['q'] ?? ''));
-$categoryFilter = (int)($_GET['category'] ?? 0);
-$subcategoryFilter = (int)($_GET['subcategory'] ?? 0);
-$stockFilter = (string)($_GET['stock'] ?? '');
-$statusFilter = (string)($_GET['status'] ?? 'active');
-$page = max(1, (int)($_GET['page'] ?? 1));
-$perPage = 200;
-$categories = $pdo->query('SELECT id, name FROM categories WHERE active = 1 ORDER BY name')->fetchAll();
-$subcategories = $pdo->query('SELECT id, category_id, name FROM sub_categories WHERE active = 1 ORDER BY name')->fetchAll();
-
-$productSql = "SELECT p.*, c.name AS category_name, sc.name AS subcategory_name,
-        COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) AS current_quantity
-    FROM products p
-    JOIN categories c ON c.id=p.category_id
-    LEFT JOIN sub_categories sc ON sc.id=p.sub_category_id
-    WHERE 1=1";
-$params = [];
-if ($statusFilter === 'active') $productSql .= ' AND p.active = 1';
-if ($statusFilter === 'inactive') $productSql .= ' AND p.active = 0';
-if ($categoryFilter > 0) { $productSql .= ' AND p.category_id = ?'; $params[] = $categoryFilter; }
-if ($subcategoryFilter > 0) { $productSql .= ' AND p.sub_category_id = ?'; $params[] = $subcategoryFilter; }
-if ($search !== '') {
-    $productSql .= ' AND (p.name LIKE ? OR p.brand LIKE ? OR p.model LIKE ? OR c.name LIKE ? OR sc.name LIKE ?)';
-    $term = '%' . $search . '%';
-    array_push($params, $term, $term, $term, $term, $term);
+$receiptOrder = null;
+$receiptOrderError = null;
+$receiptOrderRequested = array_key_exists('receive_order', $_GET);
+$receiptOrderId = $receiptOrderRequested
+    ? filter_var($_GET['receive_order'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])
+    : false;
+if ($receiptOrderRequested) {
+    requirePermission('orders', 'order_receive');
+    if (!$receiptOrderId) {
+        $receiptOrderError = 'This purchase order is unavailable for receipt.';
+    } else {
+        $receiptQuery = $pdo->prepare("SELECT o.id,o.product_id,o.quantity,o.unit_price,o.order_reason,o.reference_number,o.notes,o.status,o.vendor_id,COALESCE(o.vendor_name_snapshot,o.vendor,v.vendor_name) vendor_name,p.category_id,p.sub_category_id,p.active product_active,COALESCE(receipts.received_quantity,0) received_quantity FROM inventory_transactions o JOIN products p ON p.id=o.product_id LEFT JOIN vendors v ON v.id=o.vendor_id LEFT JOIN (SELECT related_order_id,SUM(quantity) received_quantity FROM inventory_transactions WHERE transaction_type='in' AND related_order_id IS NOT NULL GROUP BY related_order_id) receipts ON receipts.related_order_id=o.id WHERE o.id=? AND o.transaction_type='ordered'");
+        $receiptQuery->execute([(int)$receiptOrderId]);
+        $candidateReceiptOrder = $receiptQuery->fetch() ?: null;
+        try {
+            $receiptState = purchaseOrderReceiptState($candidateReceiptOrder, (int)($candidateReceiptOrder['received_quantity'] ?? 0));
+            if (!(int)$candidateReceiptOrder['product_active']) throw new DomainException('This purchase order product is inactive and cannot be received.');
+            $receiptOrder = $candidateReceiptOrder + $receiptState;
+        } catch (DomainException) {
+            $receiptOrderError = 'This purchase order is unavailable for receipt. It may be unconfirmed or already complete.';
+        }
+    }
 }
-if ($stockFilter === 'out') $productSql .= ' AND COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) <= 0';
-if ($stockFilter === 'low') $productSql .= ' AND COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) > 0 AND COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) <= p.minimum_stock';
-if ($stockFilter === 'in') $productSql .= ' AND COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) > p.minimum_stock';
-$countSql = 'SELECT COUNT(*) FROM (' . $productSql . ') matching_products';
-$countStmt = $pdo->prepare($countSql);
-$countStmt->execute($params);
-$matchingCount = (int)$countStmt->fetchColumn();
-$productSql .= ' ORDER BY p.name LIMIT ' . $perPage . ' OFFSET ' . (($page - 1) * $perPage);
-$stmt = $pdo->prepare($productSql);
-$stmt->execute($params);
-$products = $stmt->fetchAll();
+$requestedStockOperation = $receiptOrder ? 'receive' : (string)($_GET['operation'] ?? 'receive');
+if (!in_array($requestedStockOperation, ['receive', 'ordered', 'out'], true)) $requestedStockOperation = 'receive';
+if ($requestedStockOperation === 'receive'
+    && ($_SESSION['flash']['message'] ?? '') === 'This stock reduction would remove units reserved by existing or queued asset tags. Retire or reconcile those assets first.') {
+    unset($_SESSION['flash']);
+}
+
+$categories = $pdo->query('SELECT id, name FROM categories WHERE active = 1 ORDER BY name')->fetchAll();
+$inventoryCategories = $pdo->query('SELECT id, name, active FROM categories ORDER BY name')->fetchAll();
+$subcategories = $pdo->query('SELECT id, category_id, name FROM sub_categories WHERE active = 1 ORDER BY name')->fetchAll();
+$inventorySubcategories = $pdo->query('SELECT id, category_id, name, active FROM sub_categories ORDER BY name')->fetchAll();
+$products = $pdo->query('SELECT p.id,p.name,p.active,p.category_id,p.sub_category_id,c.name AS category_name,sc.name AS subcategory_name FROM products p JOIN categories c ON c.id=p.category_id LEFT JOIN sub_categories sc ON sc.id=p.sub_category_id ORDER BY p.name')->fetchAll();
 
 $managedProduct = null;
 $managedCategories = $categories;
 $managedSubcategories = $subcategories;
-$manageId = (int)($_GET['manage'] ?? 0);
-if ($manageId > 0) {
+$requestedProductId = $receiptOrder
+    ? (int)$receiptOrder['product_id']
+    : max(0, (int)($_GET['product_id'] ?? $_GET['manage'] ?? 0));
+$requestedProduct = null;
+if ($requestedProductId > 0) {
     $stmt = $pdo->prepare(
         'SELECT p.*, c.name AS category_name, sc.name AS subcategory_name,
-                COALESCE((SELECT t.new_quantity FROM inventory_transactions t WHERE t.product_id=p.id ORDER BY t.transaction_at DESC,t.id DESC LIMIT 1),0) AS current_quantity
+                COALESCE((SELECT SUM(CASE WHEN t.transaction_type IN (\'in\',\'opening\') THEN ABS(t.quantity) WHEN t.transaction_type=\'out\' THEN -ABS(t.quantity) WHEN t.transaction_type=\'adjustment\' THEN t.quantity ELSE 0 END) FROM inventory_transactions t WHERE t.product_id=p.id),0) AS current_quantity
          FROM products p JOIN categories c ON c.id=p.category_id
          LEFT JOIN sub_categories sc ON sc.id=p.sub_category_id WHERE p.id=?'
     );
-    $stmt->execute([$manageId]);
-    $managedProduct = $stmt->fetch() ?: null;
-    if ($managedProduct && !array_filter($managedCategories, static fn(array $category): bool => (int)$category['id'] === (int)$managedProduct['category_id'])) {
+    $stmt->execute([$requestedProductId]);
+    $requestedProduct = $stmt->fetch() ?: null;
+    if ($requestedProduct && !array_filter($managedCategories, static fn(array $category): bool => (int)$category['id'] === (int)$requestedProduct['category_id'])) {
         $stmt = $pdo->prepare('SELECT id, name FROM categories WHERE id = ?');
-        $stmt->execute([(int)$managedProduct['category_id']]);
+        $stmt->execute([(int)$requestedProduct['category_id']]);
         $inactiveCategory = $stmt->fetch();
         if ($inactiveCategory) array_unshift($managedCategories, $inactiveCategory);
     }
-    if ($managedProduct && $managedProduct['sub_category_id'] !== null && !array_filter($managedSubcategories, static fn(array $subcategory): bool => (int)$subcategory['id'] === (int)$managedProduct['sub_category_id'])) {
+    if ($requestedProduct && $requestedProduct['sub_category_id'] !== null && !array_filter($managedSubcategories, static fn(array $subcategory): bool => (int)$subcategory['id'] === (int)$requestedProduct['sub_category_id'])) {
         $stmt = $pdo->prepare('SELECT id, category_id, name FROM sub_categories WHERE id = ?');
-        $stmt->execute([(int)$managedProduct['sub_category_id']]);
+        $stmt->execute([(int)$requestedProduct['sub_category_id']]);
         $inactiveSubcategory = $stmt->fetch();
         if ($inactiveSubcategory) array_unshift($managedSubcategories, $inactiveSubcategory);
     }
 }
+$selectedCategoryId = $receiptOrder
+    ? (int)$receiptOrder['category_id']
+    : (array_key_exists('category_id', $_GET)
+    ? max(0, (int)$_GET['category_id'])
+    : (int)($requestedProduct['category_id'] ?? 0));
+$selectedSubcategoryId = $receiptOrder
+    ? (int)($receiptOrder['sub_category_id'] ?? 0)
+    : (array_key_exists('sub_category_id', $_GET)
+    ? max(0, (int)$_GET['sub_category_id'])
+    : (int)($requestedProduct['sub_category_id'] ?? 0));
+$categoryIds = array_map(static fn(array $category): int => (int)$category['id'], $inventoryCategories);
+if (!in_array($selectedCategoryId, $categoryIds, true)) $selectedCategoryId = 0;
+$selectedSubcategory = null;
+if ($selectedSubcategoryId > 0) {
+    foreach ($inventorySubcategories as $subcategory) {
+        if ((int)$subcategory['id'] === $selectedSubcategoryId && (int)$subcategory['category_id'] === $selectedCategoryId) {
+            $selectedSubcategory = $subcategory;
+            break;
+        }
+    }
+    if ($selectedSubcategory === null) $selectedSubcategoryId = 0;
+}
+$matchingProducts = filterInventoryProductsForSelection($products, $selectedCategoryId, $selectedSubcategoryId);
+$managedProduct = $requestedProduct && inventoryProductSelectionIsValid($products, (int)$requestedProduct['id'], $selectedCategoryId, $selectedSubcategoryId)
+    ? $requestedProduct : null;
+$manageId = (int)($managedProduct['id'] ?? 0);
+$receiptToken = bin2hex(random_bytes(32));
+$confirmedOrders = [];
+if ($manageId > 0 && $canReceiveOrder) {
+    $orderList = $pdo->prepare("SELECT o.id,o.quantity,o.unit_price,o.order_reason,o.reference_number,o.notes,o.status,o.vendor_id,COALESCE(o.vendor_name_snapshot,o.vendor,v.vendor_name) vendor_name,COALESCE(SUM(r.quantity),0) received_quantity FROM inventory_transactions o LEFT JOIN vendors v ON v.id=o.vendor_id LEFT JOIN inventory_transactions r ON r.related_order_id=o.id AND r.transaction_type='in' WHERE o.product_id=? AND o.transaction_type='ordered' AND o.status='Confirmed' GROUP BY o.id HAVING o.quantity>received_quantity ORDER BY o.transaction_at DESC");
+    $orderList->execute([$manageId]);
+    $confirmedOrders = $orderList->fetchAll();
+}
+$activeVendorIdForOrder = static function (array $order) use ($activeVendors): ?int {
+    return purchaseOrderVendorSelection($order, $activeVendors)['vendor_id'];
+};
+$vendorWarningForOrder = static function (array $order) use ($activeVendors, $canViewVendors): string {
+    if (!purchaseOrderVendorSelection($order, $activeVendors)['unavailable']) return '';
+    return $canViewVendors
+        ? 'The vendor linked to this order is inactive or unavailable. Reactivate or restore that vendor before receiving.'
+        : 'Vendor selection is unavailable with your current access. Ask an administrator to resolve this order’s vendor before receiving.';
+};
+$selectedOrderVendorId = null;
+$applicationLocalDate = (new DateTimeImmutable('now', new DateTimeZone('Asia/Kolkata')))->format('Y-m-d');
+if ($receiptOrder) $selectedOrderVendorId = purchaseOrderVendorSelection($receiptOrder, $activeVendors)['vendor_id'];
+$receiptVendorWarning = $receiptOrder ? $vendorWarningForOrder($receiptOrder) : '';
 
 require __DIR__ . '/header.php';
 ?>
-<section class="card">
-    <div class="section-heading"><span class="muted"><?=number_format($matchingCount)?> matching product<?=($matchingCount===1?'':'s')?></span><button type="button" class="icon-button" id="inventory-search-toggle" aria-expanded="<?=($_GET?'true':'false')?>" aria-controls="inventory-filters" aria-label="Search and filter inventory" title="Search and filter inventory"><span aria-hidden="true">⌕</span></button></div>
-    <form method="get" class="filter-panel" id="inventory-filters" <?=($_GET?'':'hidden')?> >
-        <div class="toolbar compact-toolbar">
-        <div><label for="inventory-q">Search inventory</label><input id="inventory-q" name="q" type="search" value="<?=htmlspecialchars($search)?>" placeholder="Product, brand, model, category, or sub-category"></div>
-        <div><label for="category">Category</label><select id="category" name="category"><option value="0">All categories</option><?php foreach($categories as $category): ?><option value="<?=$category['id']?>" <?= $categoryFilter===(int)$category['id']?'selected':'' ?>><?=htmlspecialchars($category['name'])?></option><?php endforeach; ?></select></div>
-        <div><label for="subcategory">Sub-category</label><select id="subcategory" name="subcategory"><option value="0">All sub-categories</option><?php foreach($subcategories as $subcategory): ?><option value="<?=$subcategory['id']?>" data-category="<?=$subcategory['category_id']?>" <?=$subcategoryFilter===(int)$subcategory['id']?'selected':''?>><?=htmlspecialchars($subcategory['name'])?></option><?php endforeach; ?></select></div>
-        <div><label for="stock">Stock</label><select id="stock" name="stock"><option value="">All stock</option><option value="in" <?=$stockFilter==='in'?'selected':''?>>In stock</option><option value="low" <?=$stockFilter==='low'?'selected':''?>>Low stock</option><option value="out" <?=$stockFilter==='out'?'selected':''?>>Out of stock</option></select></div>
-        <div><label for="status">Product status</label><select id="status" name="status"><option value="active" <?=$statusFilter==='active'?'selected':''?>>Active</option><option value="inactive" <?=$statusFilter==='inactive'?'selected':''?>>Inactive</option><option value="all" <?=$statusFilter==='all'?'selected':''?>>All</option></select></div>
-        <input type="hidden" name="page" value="1">
-        <button class="btn" type="submit">Apply filters</button><a class="btn" href="products.php">Clear</a>
-        </div>
-    </form>
-    <div class="inventory-actions">
-        <?php if($canAddProduct): ?><a class="btn btn-glow" href="products.php?new=1">Add Product</a><?php endif; ?>
-    </div>
-    <div class="table-scroll"><table class="product-table">
-        <thead><tr><th>Product</th><th>Category</th><th>Stock</th><th>Minimum</th><th>Status</th><th>Action</th></tr></thead>
-        <tbody>
-        <?php foreach($products as $product): $quantity=(int)$product['current_quantity']; $low=$quantity<=(int)$product['minimum_stock']; ?>
-            <tr>
-                <td><?=htmlspecialchars($product['name'])?><div class="muted"><?=htmlspecialchars(trim(($product['brand']??'').' '.($product['model']??'')))?></div></td>
-                <td><?=htmlspecialchars($product['category_name'])?><?= $product['subcategory_name'] ? '<div class="muted">'.htmlspecialchars($product['subcategory_name']).'</div>' : '' ?></td>
-                <td><strong><?=$quantity?></strong></td>
-                <td><?=$product['minimum_stock']?></td>
-                <td><span class="<?= $low?'status-low':'status-ok' ?>"><?= $product['active'] ? ($quantity<=0?'Out of stock':($low?'Low stock':'In stock')) : 'Inactive' ?></span></td>
-                <td><a class="btn" href="products.php?manage=<?=$product['id']?>"><?=$canEditProduct?'Manage':'View'?></a></td>
-            </tr>
-        <?php endforeach; ?>
-        <?php if(!$products): ?><tr><td colspan="6" class="muted">No products match these filters.</td></tr><?php endif; ?>
-        </tbody>
-    </table></div>
-    <?php if($matchingCount>$perPage): ?><nav class="pagination" aria-label="Inventory pages">
-        <?php if($page>1): ?><a class="btn" href="?<?=http_build_query(array_merge($_GET,['page'=>$page-1]))?>">Previous</a><?php endif; ?>
-        <span class="muted">Page <?=$page?> of <?=ceil($matchingCount/$perPage)?></span>
-        <?php if($page*$perPage<$matchingCount): ?><a class="btn" href="?<?=http_build_query(array_merge($_GET,['page'=>$page+1]))?>">Next</a><?php endif; ?>
-    </nav><?php endif; ?>
-</section>
-
-<?php if ($managedProduct): ?>
-<section class="grid two section-spaced">
+<section class="inventory-screen inventory-products-screen grid two">
+    <?php if ($receiptOrderError): ?><div class="alert error form-wide" role="alert"><?=htmlspecialchars($receiptOrderError, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></div><?php endif; ?>
     <div class="card">
-        <h2><?=$canEditProduct?'Manage product':'Product details'?>: <?=htmlspecialchars($managedProduct['name'])?></h2>
+        <div class="section-heading"><h2>Manage Product</h2><?php if($canAddProduct): ?><a class="btn btn-glow" href="products.php?new=1">Add Product</a><?php endif; ?></div>
+        <form method="get" class="product-picker" id="inventory-product-picker">
+            <div><label for="inventory-category">Category</label><select id="inventory-category" name="category_id" required><option value="">Choose a category</option><?php foreach($inventoryCategories as $category): ?><option value="<?=$category['id']?>" <?= $selectedCategoryId===(int)$category['id']?'selected':'' ?>><?=htmlspecialchars($category['name'].(!$category['active']?' (Inactive)':''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></option><?php endforeach; ?></select></div>
+            <div><label for="inventory-subcategory">Sub-category (optional)</label><select id="inventory-subcategory" name="sub_category_id" <?=$selectedCategoryId<1?'disabled':''?>><option value="">All sub-categories</option><?php foreach($inventorySubcategories as $subcategory): ?><option value="<?=$subcategory['id']?>" data-category="<?=$subcategory['category_id']?>" <?= $selectedSubcategoryId===(int)$subcategory['id']?'selected':'' ?>><?=htmlspecialchars($subcategory['name'].(!$subcategory['active']?' (Inactive)':''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></option><?php endforeach; ?></select></div>
+            <div><label for="inventory-product">Product (optional)</label><select id="inventory-product" name="product_id" <?=$selectedCategoryId<1?'disabled':''?>><option value="">All matching products</option><?php foreach($products as $product): ?><option value="<?=$product['id']?>" data-category="<?=$product['category_id']?>" data-subcategory="<?=$product['sub_category_id']??''?>" <?= $manageId===(int)$product['id']?'selected':'' ?>><?=htmlspecialchars($product['name'].(!$product['active']?' (Inactive)':''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></option><?php endforeach; ?></select></div>
+            <button class="btn" type="submit">View Inventory</button>
+        </form>
+        <?php if ($selectedCategoryId > 0 && !$managedProduct): ?>
+            <?php if ($matchingProducts): ?><ul class="product-match-list" aria-label="Matching inventory products">
+                <?php foreach ($matchingProducts as $product): ?><li><div><strong><?=htmlspecialchars($product['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></strong><span class="muted"><?=htmlspecialchars($product['category_name'].($product['subcategory_name'] ? ' · '.$product['subcategory_name'] : '').(!$product['active']?' · Inactive':''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></span></div><a class="btn" href="products.php?<?=http_build_query(['category_id'=>$selectedCategoryId,'sub_category_id'=>$selectedSubcategoryId ?: '','product_id'=>(int)$product['id']])?>"><?=$canEditProduct?'Manage':'View'?></a></li><?php endforeach; ?>
+            </ul><?php else: ?><p class="muted">No products match this category selection.</p><?php endif; ?>
+        <?php endif; ?>
+        <?php if ($managedProduct): ?>
+        <h3><?=htmlspecialchars($managedProduct['name'])?></h3>
         <p>Current stock: <strong><?=$managedProduct['current_quantity']?></strong></p>
         <?php if($canEditProduct): ?>
         <form method="post" class="product-form" id="edit-product-form">
@@ -333,38 +427,49 @@ require __DIR__ . '/header.php';
         </form>
         <div class="inline-actions product-management-actions"><button class="btn btn-glow" type="submit" form="edit-product-form">Save changes</button></div>
         <?php endif; ?>
+        <?php else: ?><p class="muted">Select a product to view or edit its details.</p><?php endif; ?>
     </div>
 
     <div class="card">
-        <h2>Stock</h2>
-        <?php if($canChangeProductStatus): ?><form method="post" class="product-status-form" onsubmit="return confirm('Change this product status?')"><input type="hidden" name="csrf" value="<?=htmlspecialchars(csrf())?>"><input type="hidden" name="action" value="toggle"><input type="hidden" name="product_id" value="<?=$managedProduct['id']?>"><button class="btn <?=$managedProduct['active']?'btn-danger':'btn-success'?>" type="submit"><?=$managedProduct['active']?'Deactivate product':'Reactivate product'?></button></form><?php endif; ?>
-        <?php if($canAdjustStock && $managedProduct['active']): ?>
-        <form method="post" class="stacked-form">
+        <div class="section-heading product-panel-heading"><h2>Stock management</h2>
+        <?php if($canChangeProductStatus && $managedProduct): ?><form method="post" class="product-status-form" onsubmit="return confirm('Change this product status?')"><input type="hidden" name="csrf" value="<?=htmlspecialchars(csrf())?>"><input type="hidden" name="action" value="toggle"><input type="hidden" name="product_id" value="<?=$managedProduct['id']?>"><button class="btn <?=$managedProduct['active']?'btn-danger':'btn-success'?>" type="submit"><?=$managedProduct['active']?'Deactivate product':'Reactivate product'?></button></form><?php endif; ?></div>
+        <?php if ($managedProduct): ?>
+        <?php if(($canAdjustStock || $canReceiveOrder) && $managedProduct['active']): ?>
+        <form method="post" class="stacked-form" id="product-stock-form" data-open-receipt="<?=$receiptOrder?'1':'0'?>" data-receipt-requires-order="<?=$canAdjustStock?'0':'1'?>">
             <input type="hidden" name="csrf" value="<?=htmlspecialchars(csrf())?>"><input type="hidden" name="action" value="stock"><input type="hidden" name="product_id" value="<?=$managedProduct['id']?>">
-            <label>Operation</label><select name="operation" data-stock-operation required><option value="in">Add stock</option><?php if(canPerform('orders', 'add')): ?><option value="ordered">Order</option><?php endif; ?><option value="out">Remove stock</option></select>
-            <label>Quantity</label><input name="quantity" type="number" min="1" step="1" required>
-            <div data-stock-pricing hidden>
-                <label>Price per unit (₹)</label><input name="unit_price" type="number" min="0" step="0.01" inputmode="decimal">
-                <?php renderVendorPicker($activeVendors, 'product-stock-vendor'); ?>
-                <label>Total Price (₹)</label><input type="text" data-stock-total value="₹0.00" readonly aria-readonly="true">
+            <label>Operation</label><select name="operation" data-stock-operation required><?php if($canAdjustStock||$canReceiveOrder): ?><option value="receive" <?=$requestedStockOperation==='receive'?'selected':''?>>Receive Stock</option><?php endif; ?><?php if(!$receiptOrder && canPerform('orders', 'add')): ?><option value="ordered" <?=$requestedStockOperation==='ordered'?'selected':''?>>Order Stock</option><?php endif; ?><?php if(!$receiptOrder && $canAdjustStock): ?><option value="out" <?=$requestedStockOperation==='out'?'selected':''?>>Remove Stock</option><?php endif; ?></select>
+            <label>Quantity</label><input name="quantity" type="number" min="1" step="1" required <?=$receiptOrder?'value="' . (int)$receiptOrder['remaining_quantity'] . '" max="' . (int)$receiptOrder['remaining_quantity'] . '"':''?>>
+            <input type="hidden" name="request_key" value="<?=htmlspecialchars($receiptToken, ENT_QUOTES)?>">
+            <div data-stock-pricing>
+                <label>Unit purchase price (INR)</label><input name="unit_price" type="number" min="0" step="0.01" inputmode="decimal" value="<?=$receiptOrder && $receiptOrder['unit_price'] !== null ? htmlspecialchars((string)$receiptOrder['unit_price'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : ''?>" <?=$receiptOrder?'readonly aria-readonly="true"':''?>>
+                <?php renderVendorPicker($activeVendors, 'product-stock-vendor', $selectedOrderVendorId); ?>
+                <p class="alert info form-wide" role="alert" tabindex="-1" data-order-vendor-warning<?=$receiptVendorWarning === '' ? ' hidden' : ''?>><?=htmlspecialchars($receiptVendorWarning, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?></p>
+                <label>Total Price (INR)</label><input type="text" data-stock-total value="₹0.00" readonly aria-readonly="true">
+                <label>Purchase order (optional)</label><select name="order_id" data-order-select><?php if($canAdjustStock): ?><option value="">Direct receipt without order</option><?php endif; ?><?php foreach($confirmedOrders as $order): ?><option value="<?=$order['id']?>" data-remaining="<?=max(0,(int)$order['quantity']-(int)$order['received_quantity'])?>" data-unit-price="<?=htmlspecialchars((string)($order['unit_price'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>" data-vendor-id="<?=$activeVendorIdForOrder($order) ?? 0?>" data-vendor-warning="<?=htmlspecialchars($vendorWarningForOrder($order), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>" data-reason="<?=htmlspecialchars((string)($order['order_reason'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>" data-reference="<?=htmlspecialchars((string)($order['reference_number'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>" data-notes="<?=htmlspecialchars((string)($order['notes'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')?>" <?=((int)($receiptOrder['id'] ?? 0)===(int)$order['id'])?'selected':''?>>Order #<?=$order['id']?> · <?=((int)$order['quantity']-(int)$order['received_quantity'])?> remaining</option><?php endforeach; ?></select>
+                <label>Received date</label><input name="received_date" type="date" value="<?=$receiptOrder ? $applicationLocalDate : date('Y-m-d')?>">
+                <label>Invoice/reference number (optional)</label><input name="reference_number" maxlength="180" value="<?=$receiptOrder ? htmlspecialchars((string)($receiptOrder['reference_number'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : ''?>">
+                <label>Notes (optional)</label><textarea name="notes" maxlength="2000"><?=$receiptOrder ? htmlspecialchars((string)($receiptOrder['notes'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : ''?></textarea>
             </div>
-            <label>Reason</label><select name="reason" required><option value="">Choose reason</option><option>Requested</option><option>New</option><option>Replacement</option><option>Purchase</option></select>
+            <label>Reason</label><select name="reason" data-stock-reason required><option value="">Choose reason</option><option data-modes="receive,ordered" <?=$receiptOrder && $receiptOrder['order_reason']==='Requested'?'selected':''?>>Requested</option><option data-modes="receive,ordered" <?=$receiptOrder && $receiptOrder['order_reason']==='New'?'selected':''?>>New</option><option data-modes="receive,ordered" <?=$receiptOrder && $receiptOrder['order_reason']==='Replacement'?'selected':''?>>Replacement</option><option data-modes="out">Damaged</option><option data-modes="out">Disposed</option><option data-modes="out">Other removal</option><option data-modes="ordered">Purchase</option></select>
             <button class="btn btn-glow" type="submit">Save stock change</button>
         </form>
         <script>
-        (function(){const form=document.currentScript.previousElementSibling,operation=form.querySelector('[data-stock-operation]'),pricing=form.querySelector('[data-stock-pricing]'),quantity=form.elements.quantity,price=form.elements.unit_price,vendor=form.querySelector('[data-vendor-search]'),total=form.querySelector('[data-stock-total]');
-        function update(){const priced=operation.value==='ordered';pricing.hidden=!priced;price.required=priced;vendor.required=priced;}
+        (function(){const form=document.currentScript.previousElementSibling,operation=form.querySelector('[data-stock-operation]'),pricing=form.querySelector('[data-stock-pricing]'),quantity=form.elements.quantity,price=form.elements.unit_price,vendor=form.querySelector('[data-vendor-search]'),total=form.querySelector('[data-stock-total]'),vendorWarning=form.querySelector('[data-order-vendor-warning]');
+        function update(){const receiving=operation.value==='receive',ordered=operation.value==='ordered';pricing.hidden=!receiving&&!ordered;price.required=receiving||ordered;if(vendor)vendor.required=receiving||ordered;form.elements.received_date.required=receiving;form.elements.order_id.disabled=!receiving;form.elements.order_id.required=receiving&&form.dataset.receiptRequiresOrder==='1';form.elements.reference_number.disabled=!receiving;form.elements.notes.disabled=!receiving;form.elements.reason.required=true;Array.from(form.querySelector('[data-stock-reason]').options).forEach(function(option){if(!option.value)return;const modes=(option.dataset.modes||'').split(',');option.hidden=!modes.includes(operation.value);});if(form.elements.reason.selectedOptions[0]?.hidden)form.elements.reason.value='';}
+        const orderSelect=form.querySelector('[data-order-select]'),vendorPicker=form.querySelector('[data-vendor-picker]');
         function calculate(){const q=Number(quantity.value)||0,p=Number(price.value)||0;total.value=window.formatCurrencyINR(q*p);}
-        operation.addEventListener('change',update);quantity.addEventListener('input',calculate);price.addEventListener('input',calculate);update();calculate();})();
+        function applyOrder(){if(!orderSelect)return;const selected=orderSelect.selectedOptions[0],hasOrder=Boolean(selected&&selected.value);if(hasOrder){const remaining=Number(selected.dataset.remaining)||0;quantity.max=String(remaining);quantity.value=String(remaining);price.value=selected.dataset.unitPrice||'';price.readOnly=price.value!=='';if(price.readOnly)price.setAttribute('aria-readonly','true');else price.removeAttribute('aria-readonly');form.elements.reason.value=selected.dataset.reason||'';form.elements.reference_number.value=selected.dataset.reference||'';form.elements.notes.value=selected.dataset.notes||'';if(vendorWarning){vendorWarning.textContent=selected.dataset.vendorWarning||'';vendorWarning.hidden=!vendorWarning.textContent;form.dataset.orderVendorUnavailable=vendorWarning.hidden?'0':'1';}if(vendorPicker)vendorPicker.dispatchEvent(new CustomEvent('vendor-picker:select',{detail:{vendorId:Number(selected.dataset.vendorId)||0}}));}else{quantity.removeAttribute('max');quantity.value='';price.value='';price.readOnly=false;price.removeAttribute('aria-readonly');form.elements.reason.value='';form.elements.reference_number.value='';form.elements.notes.value='';if(vendorWarning){vendorWarning.textContent='';vendorWarning.hidden=true;form.dataset.orderVendorUnavailable='0';}if(vendorPicker)vendorPicker.dispatchEvent(new CustomEvent('vendor-picker:select',{detail:{vendorId:0}}));}calculate();}
+        operation.addEventListener('change',update);quantity.addEventListener('input',calculate);price.addEventListener('input',calculate);orderSelect?.addEventListener('change',applyOrder);form.addEventListener('submit',function(event){if(form.dataset.orderVendorUnavailable==='1'){event.preventDefault();vendorWarning?.focus();}});update();if(orderSelect?.value)applyOrder();else calculate();})();
         </script>
         <?php elseif(!$managedProduct['active']): ?><p class="muted">This product is inactive.</p>
         <?php else: ?><p class="muted">Contact a manager to change this stock.</p>
         <?php endif; ?>
         <?php if(canViewResource('history')): ?><p><a href="history.php?product=<?=$managedProduct['id']?>">View stock history</a></p><?php endif; ?>
         <?php if(canViewResource('assignments')): ?><p><a href="assignments.php">Employee assignments (advanced)</a></p><?php endif; ?>
+        <?php else: ?><p class="muted">Select a product to manage stock.</p><?php endif; ?>
     </div>
 </section>
-<?php elseif ($manageId > 0): ?><div class="alert error">Product not found.</div><?php endif; ?>
+<?php if ($requestedProductId > 0 && !$managedProduct): ?><div class="alert error">That product does not match the selected category and sub-category.</div><?php endif; ?>
 
 <?php if ($canAddProduct && isset($_GET['new'])): ?>
 <section class="card section-spaced">
@@ -387,8 +492,19 @@ require __DIR__ . '/header.php';
 
 <script>
 (function(){
- const toggle=document.getElementById('inventory-search-toggle'),panel=document.getElementById('inventory-filters');if(toggle&&panel)toggle.addEventListener('click',function(){const opening=panel.hidden;panel.hidden=!opening;toggle.setAttribute('aria-expanded',String(opening));if(opening)panel.querySelector('input[type="search"]').focus();});
- const category=document.getElementById('category'),subcategory=document.getElementById('subcategory');if(category&&subcategory){function filterSubcategories(){for(const option of subcategory.options){if(!option.value)continue;const valid=category.value==='0'||option.dataset.category===category.value;option.hidden=!valid;option.disabled=!valid;if(!valid&&option.selected)subcategory.value='0';}}category.addEventListener('change',filterSubcategories);filterSubcategories();}
+ const inventoryCategory=document.getElementById('inventory-category'),inventorySubcategory=document.getElementById('inventory-subcategory'),inventoryProduct=document.getElementById('inventory-product');
+ if(inventoryCategory&&inventorySubcategory&&inventoryProduct){
+  function filterInventoryOptions(){
+   const categoryId=inventoryCategory.value;
+   inventorySubcategory.disabled=!categoryId;inventoryProduct.disabled=!categoryId;
+   for(const option of inventorySubcategory.options){if(!option.value)continue;const matches=option.dataset.category===categoryId;option.hidden=!matches;option.disabled=!matches;if(!matches&&option.selected)inventorySubcategory.value='';}
+   const chosenSubcategory=inventorySubcategory.value;
+   for(const option of inventoryProduct.options){if(!option.value)continue;const matches=option.dataset.category===categoryId&&(!chosenSubcategory||option.dataset.subcategory===chosenSubcategory);option.hidden=!matches;option.disabled=!matches;if(!matches&&option.selected)inventoryProduct.value='';}
+  }
+  inventoryCategory.addEventListener('change',function(){inventorySubcategory.value='';inventoryProduct.value='';filterInventoryOptions();});
+  inventorySubcategory.addEventListener('change',function(){inventoryProduct.value='';filterInventoryOptions();});
+  filterInventoryOptions();
+ }
  document.querySelectorAll('[data-numeric-only]').forEach(function(field){
   const validate=function(){field.setCustomValidity(field.value!==''&&!/^[0-9]+$/.test(field.value)?'Unit must contain numbers only.':'');};
   field.addEventListener('input',validate);field.form.addEventListener('submit',validate);
@@ -397,6 +513,17 @@ require __DIR__ . '/header.php';
  if(editCategory&&editSubcategory){function filter(){for(const option of editSubcategory.options){if(!option.value)continue;const valid=option.dataset.category===editCategory.value;option.hidden=!valid;option.disabled=!valid;if(!valid&&option.selected)editSubcategory.value='';}}editCategory.addEventListener('change',filter);filter();}
  const newCategory=document.getElementById('new_category'),newSubcategory=document.getElementById('new_subcategory');
  if(newCategory&&newSubcategory){function filterNew(){for(const option of newSubcategory.options){if(!option.value)continue;const valid=option.dataset.category===newCategory.value;option.hidden=!valid;option.disabled=!valid;if(!valid&&option.selected)newSubcategory.value='';}}newCategory.addEventListener('change',filterNew);filterNew();}
+})();
+</script>
+<script>
+(function(){
+ const form=document.querySelector('#product-stock-form[data-open-receipt="1"]');
+ if(!form)return;
+ const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+ window.requestAnimationFrame(function(){
+  form.scrollIntoView({behavior:reducedMotion?'auto':'smooth',block:'start'});
+  form.querySelector('[data-stock-operation]')?.focus({preventScroll:true});
+ });
 })();
 </script>
 <?php require __DIR__ . '/footer.php'; ?>

@@ -118,9 +118,23 @@ CREATE TABLE IF NOT EXISTS credential_migration_mappings (
 -- Intentionally no INSERTs into role_permission_defaults or user_permissions:
 -- credential access remains disabled for non-admins until an Admin grants it.
 
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip_address VARCHAR(64) NULL;
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS source_system VARCHAR(64) NULL;
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS source_id BIGINT UNSIGNED NULL;
+DELIMITER //
+DROP PROCEDURE IF EXISTS migrate_credential_audit_columns_20261014//
+CREATE PROCEDURE migrate_credential_audit_columns_20261014()
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='audit_logs' AND COLUMN_NAME='ip_address') THEN
+        ALTER TABLE audit_logs ADD COLUMN ip_address VARCHAR(64) NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='audit_logs' AND COLUMN_NAME='source_system') THEN
+        ALTER TABLE audit_logs ADD COLUMN source_system VARCHAR(64) NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='audit_logs' AND COLUMN_NAME='source_id') THEN
+        ALTER TABLE audit_logs ADD COLUMN source_id BIGINT UNSIGNED NULL;
+    END IF;
+END//
+CALL migrate_credential_audit_columns_20261014()//
+DROP PROCEDURE migrate_credential_audit_columns_20261014//
+DELIMITER ;
 
 INSERT IGNORE INTO credential_departments(name) SELECT DISTINCT TRIM(department) FROM employees WHERE department IS NOT NULL AND TRIM(department)<>'';
 ALTER TABLE audit_logs MODIFY action VARCHAR(120) NOT NULL;

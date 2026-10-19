@@ -12,7 +12,7 @@
  const hiddenWaveY=110;
  const coveredWaveY=-72;
  const clearWaveY=-210;
- const routes=new Set(['dashboard.php','products.php','inventory.php','assignments.php','employees.php','employee.php','categories.php','orders.php','vendors.php','vendor.php','history.php','users.php','audit_logs.php','credentials.php','credential-access.php','search.php']);
+ const routes=new Set(['dashboard.php','products.php','inventory.php','category-inventory.php','inventory-details.php','hardware-assets.php','assignments.php','employees.php','employee.php','categories.php','orders.php','vendors.php','vendor.php','history.php','users.php','audit_logs.php','credentials.php','credential-access.php','search.php']);
  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
  const backdrop=overlay.querySelector('.im-ocean-transition__backdrop');
  const waves=Array.from(overlay.querySelectorAll('.im-ocean-transition__wave'));

@@ -1,16 +1,42 @@
-CREATE DATABASE IF NOT EXISTS inventory_manager;
-USE inventory_manager;
+-- Run against the database selected by the connection. Docker's MariaDB
+-- entrypoint creates and selects MARIADB_DATABASE before importing this file.
 
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     full_name VARCHAR(150) NOT NULL,
     username VARCHAR(100) NOT NULL UNIQUE,
+    email VARCHAR(190) NULL,
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('admin','editor','viewer') NOT NULL DEFAULT 'viewer',
     active TINYINT(1) NOT NULL DEFAULT 1,
     auth_version INT UNSIGNED NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- Credential-only TOTP enforcement. Login behavior remains account-wide-password based.
+CREATE TABLE IF NOT EXISTS login_attempt_limits (
+    bucket_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+    attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    expires_at DATETIME NOT NULL,
+    INDEX idx_login_attempt_expiry (expires_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS user_credential_totp (
+    user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+    required TINYINT(1) NOT NULL DEFAULT 0,
+    status ENUM('pending','active','reset_required') NULL DEFAULT NULL,
+    secret_enc TEXT NULL,
+    pending_secret_enc TEXT NULL,
+    last_accepted_step BIGINT NOT NULL DEFAULT -1,
+    failed_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    locked_until DATETIME NULL,
+    generation INT UNSIGNED NOT NULL DEFAULT 1,
+    updated_by BIGINT UNSIGNED NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_user_credential_totp_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_user_credential_totp_updated_by FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS vendors (
@@ -111,12 +137,15 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
     rejected_at DATETIME NULL,
     rejected_by BIGINT UNSIGNED NULL,
     rejection_reason VARCHAR(500) NULL,
+    request_key CHAR(64) NULL,
     related_order_id BIGINT UNSIGNED NULL,
     notes TEXT NULL,
+    reference_number VARCHAR(180) NULL,
     created_by BIGINT UNSIGNED NOT NULL,
     transaction_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_transaction_product_date (product_id, transaction_at),
+    UNIQUE KEY uq_inventory_transaction_request_key (request_key),
     CONSTRAINT fk_transaction_product FOREIGN KEY (product_id) REFERENCES products(id),
     CONSTRAINT fk_transaction_month FOREIGN KEY (inventory_month_id) REFERENCES inventory_months(id) ON DELETE SET NULL,
     CONSTRAINT fk_transaction_user FOREIGN KEY (created_by) REFERENCES users(id),
@@ -124,6 +153,20 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
     CONSTRAINT fk_transaction_confirmed_user FOREIGN KEY (confirmed_by) REFERENCES users(id) ON DELETE SET NULL,
     CONSTRAINT fk_transaction_rejected_user FOREIGN KEY (rejected_by) REFERENCES users(id) ON DELETE SET NULL,
     CONSTRAINT fk_transaction_order FOREIGN KEY (related_order_id) REFERENCES inventory_transactions(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS inventory_cost_layers (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    product_id BIGINT UNSIGNED NOT NULL,
+    source_transaction_id BIGINT UNSIGNED NULL UNIQUE,
+    reconciliation_id BIGINT UNSIGNED NULL,
+    unit_cost DECIMAL(13,2) NOT NULL,
+    original_quantity INT UNSIGNED NOT NULL,
+    remaining_quantity INT UNSIGNED NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_inventory_cost_layers_available (product_id, remaining_quantity, id),
+    CONSTRAINT fk_inventory_cost_layer_product FOREIGN KEY (product_id) REFERENCES products(id),
+    CONSTRAINT fk_inventory_cost_layer_transaction FOREIGN KEY (source_transaction_id) REFERENCES inventory_transactions(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS order_reminder_attempts (
@@ -138,18 +181,126 @@ CREATE TABLE IF NOT EXISTS order_reminder_attempts (
     CONSTRAINT fk_order_reminder_transaction FOREIGN KEY (order_id) REFERENCES inventory_transactions(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS order_email_outbox (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(191) NOT NULL UNIQUE,
+    event_type VARCHAR(40) NOT NULL,
+    recipient_email VARCHAR(254) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    html_body LONGTEXT NOT NULL,
+    text_body LONGTEXT NOT NULL,
+    status ENUM('pending','processing','sent','failed') NOT NULL DEFAULT 'pending',
+    attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    available_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_at DATETIME NULL,
+    sent_at DATETIME NULL,
+    last_error VARCHAR(1000) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_order_email_outbox_ready (status, available_at, id),
+    INDEX idx_order_email_outbox_locked (status, locked_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS asset_tag_jobs (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    request_key CHAR(64) NOT NULL UNIQUE,
+    request_hash CHAR(64) NOT NULL,
+    product_id BIGINT UNSIGNED NOT NULL,
+    prefix VARCHAR(60) NOT NULL,
+    starting_number BIGINT UNSIGNED NOT NULL,
+    quantity INT UNSIGNED NOT NULL,
+    padding_digits TINYINT UNSIGNED NOT NULL,
+    asset_location VARCHAR(150) NULL,
+    asset_condition VARCHAR(80) NULL,
+    registration_type ENUM('available','reconciliation') NOT NULL,
+    serial_mode ENUM('manual','automatic','fill_later') NOT NULL DEFAULT 'fill_later',
+    serial_prefix VARCHAR(60) NULL,
+    internal_serial_first_number BIGINT UNSIGNED NULL,
+    status ENUM('pending','processing','completed','failed') NOT NULL DEFAULT 'pending',
+    next_offset INT UNSIGNED NOT NULL DEFAULT 0,
+    batch_size SMALLINT UNSIGNED NOT NULL DEFAULT 250,
+    attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    last_error VARCHAR(1000) NULL,
+    created_by BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    completed_at DATETIME NULL,
+    INDEX idx_asset_tag_jobs_work (status,id),
+    INDEX idx_asset_tag_jobs_product (product_id,status),
+    CONSTRAINT fk_asset_tag_job_product FOREIGN KEY (product_id) REFERENCES products(id),
+    CONSTRAINT fk_asset_tag_job_user FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS asset_tag_ranges (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    job_id BIGINT UNSIGNED NOT NULL,
+    prefix VARCHAR(60) NOT NULL,
+    first_number BIGINT UNSIGNED NOT NULL,
+    last_number BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_asset_tag_range_job (job_id),
+    INDEX idx_asset_tag_range_prefix (prefix,first_number,last_number),
+    CONSTRAINT fk_asset_tag_range_job FOREIGN KEY (job_id) REFERENCES asset_tag_jobs(id) ON DELETE RESTRICT,
+    CONSTRAINT chk_asset_tag_range_order CHECK (last_number >= first_number)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS asset_tag_prefix_sequences (
+    prefix VARCHAR(60) NOT NULL PRIMARY KEY,
+    next_number BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS asset_tag_registry (
+    asset_tag VARCHAR(100) NOT NULL PRIMARY KEY,
+    prefix VARCHAR(60) NULL,
+    numeric_value BIGINT UNSIGNED NULL,
+    request_key CHAR(64) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_asset_tag_registry_numeric (prefix,numeric_value)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS inventory_assets (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     product_id BIGINT UNSIGNED NOT NULL,
     asset_tag VARCHAR(100) NOT NULL UNIQUE,
     serial_number VARCHAR(150) NULL UNIQUE,
+    internal_serial_number VARCHAR(150) NULL UNIQUE,
+    acquisition_unit_cost DECIMAL(13,2) NULL,
+    acquisition_cost_layer_id BIGINT UNSIGNED NULL,
     status ENUM('available','assigned','reserved','maintenance','damaged','lost','returned','disposed') NOT NULL DEFAULT 'available',
     location VARCHAR(150) NULL,
+    asset_condition VARCHAR(80) NULL,
+    asset_tag_job_id BIGINT UNSIGNED NULL,
     notes TEXT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    CONSTRAINT fk_asset_product FOREIGN KEY (product_id) REFERENCES products(id)
+    INDEX idx_inventory_asset_product_status (product_id,status),
+    INDEX idx_inventory_asset_tag_job (asset_tag_job_id),
+    CONSTRAINT fk_asset_product FOREIGN KEY (product_id) REFERENCES products(id),
+    CONSTRAINT fk_inventory_asset_tag_job FOREIGN KEY (asset_tag_job_id) REFERENCES asset_tag_jobs(id) ON DELETE SET NULL,
+    CONSTRAINT fk_inventory_asset_cost_layer FOREIGN KEY (acquisition_cost_layer_id) REFERENCES inventory_cost_layers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS internal_serial_prefix_sequences (
+    prefix VARCHAR(60) NOT NULL PRIMARY KEY,
+    next_number BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS manufacturer_serial_registry (
+    serial_number VARCHAR(150) NOT NULL PRIMARY KEY,
+    job_id BIGINT UNSIGNED NULL,
+    job_offset INT UNSIGNED NULL,
+    asset_id BIGINT UNSIGNED NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_manufacturer_serial_job_offset (job_id,job_offset),
+    UNIQUE KEY uq_manufacturer_serial_asset (asset_id),
+    INDEX idx_manufacturer_serial_job (job_id,job_offset),
+    CONSTRAINT fk_manufacturer_serial_job FOREIGN KEY (job_id) REFERENCES asset_tag_jobs(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_manufacturer_serial_asset FOREIGN KEY (asset_id) REFERENCES inventory_assets(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+INSERT IGNORE INTO asset_tag_registry (asset_tag, prefix, numeric_value, request_key)
+    SELECT asset_tag, NULL, NULL, NULL FROM inventory_assets;
 
 CREATE TABLE IF NOT EXISTS employees (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -168,6 +319,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     product_id BIGINT UNSIGNED NOT NULL,
     asset_id BIGINT UNSIGNED NULL,
     quantity INT UNSIGNED NOT NULL DEFAULT 1,
+    returned_quantity INT UNSIGNED NOT NULL DEFAULT 0,
     assigned_to VARCHAR(150) NOT NULL,
     employee_id VARCHAR(100) NULL,
     employee_record_id BIGINT UNSIGNED NULL,
@@ -179,6 +331,8 @@ CREATE TABLE IF NOT EXISTS assignments (
     status ENUM('assigned','returned','cancelled','replaced','removed') NOT NULL DEFAULT 'assigned',
     condition_at_assignment VARCHAR(80) NULL,
     notes TEXT NULL,
+    INDEX idx_assignment_product_tag_reconcile (product_id,status,returned_at,asset_id),
+    INDEX idx_assignment_asset_status_returned (asset_id,status,returned_at),
     CONSTRAINT fk_assignment_product FOREIGN KEY (product_id) REFERENCES products(id),
     CONSTRAINT fk_assignment_asset FOREIGN KEY (asset_id) REFERENCES inventory_assets(id) ON DELETE SET NULL,
     CONSTRAINT fk_assignment_user FOREIGN KEY (assigned_by) REFERENCES users(id),
@@ -197,19 +351,67 @@ CREATE TABLE IF NOT EXISTS hardware_assignment_history (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     employee_id BIGINT UNSIGNED NOT NULL,
     assignment_id BIGINT UNSIGNED NOT NULL,
-    action ENUM('assigned','replaced','returned','removed') NOT NULL,
+    action ENUM('assigned','replaced','returned','removed','reassigned','tagged') NOT NULL,
     reason TEXT NULL,
     old_asset_id BIGINT UNSIGNED NULL,
     new_asset_id BIGINT UNSIGNED NULL,
     performed_by BIGINT UNSIGNED NULL,
+    transaction_id BIGINT UNSIGNED NULL,
+    event_quantity INT UNSIGNED NULL,
+    cost_covered_quantity INT UNSIGNED NULL,
+    acquisition_value DECIMAL(13,2) NULL,
     performed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_hardware_history_employee (employee_id, performed_at),
+    INDEX idx_hardware_history_transaction (transaction_id),
     CONSTRAINT fk_hardware_history_employee FOREIGN KEY (employee_id) REFERENCES employees(id),
     CONSTRAINT fk_hardware_history_assignment FOREIGN KEY (assignment_id) REFERENCES assignments(id),
     CONSTRAINT fk_hardware_history_old_asset FOREIGN KEY (old_asset_id) REFERENCES inventory_assets(id) ON DELETE SET NULL,
     CONSTRAINT fk_hardware_history_new_asset FOREIGN KEY (new_asset_id) REFERENCES inventory_assets(id) ON DELETE SET NULL,
-    CONSTRAINT fk_hardware_history_user FOREIGN KEY (performed_by) REFERENCES users(id) ON DELETE SET NULL
+    CONSTRAINT fk_hardware_history_user FOREIGN KEY (performed_by) REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT fk_hardware_history_transaction FOREIGN KEY (transaction_id) REFERENCES inventory_transactions(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS inventory_cost_allocations (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    cost_layer_id BIGINT UNSIGNED NOT NULL,
+    assignment_id BIGINT UNSIGNED NULL,
+    source_transaction_id BIGINT UNSIGNED NULL,
+    source_type ENUM('assignment','stock_removal') NOT NULL,
+    quantity INT UNSIGNED NOT NULL,
+    returned_quantity INT UNSIGNED NOT NULL DEFAULT 0,
+    unit_cost DECIMAL(13,2) NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_inventory_cost_allocation_assignment (assignment_id, id),
+    INDEX idx_inventory_cost_allocation_transaction (source_transaction_id),
+    CONSTRAINT fk_inventory_cost_allocation_layer FOREIGN KEY (cost_layer_id) REFERENCES inventory_cost_layers(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_inventory_cost_allocation_assignment FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_inventory_cost_allocation_transaction FOREIGN KEY (source_transaction_id) REFERENCES inventory_transactions(id) ON DELETE RESTRICT
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS inventory_cost_reconciliations (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    kind ENUM('receipt','asset','assignment','disposal') NOT NULL,
+    product_id BIGINT UNSIGNED NOT NULL,
+    source_transaction_id BIGINT UNSIGNED NULL,
+    asset_id BIGINT UNSIGNED NULL,
+    assignment_id BIGINT UNSIGNED NULL,
+    quantity INT UNSIGNED NOT NULL,
+    unit_cost DECIMAL(13,2) NOT NULL,
+    source_reference VARCHAR(180) NOT NULL,
+    notes TEXT NOT NULL,
+    created_by BIGINT UNSIGNED NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cost_reconciliation_product (product_id, created_at),
+    INDEX idx_cost_reconciliation_source (source_transaction_id),
+    CONSTRAINT fk_cost_reconciliation_product FOREIGN KEY (product_id) REFERENCES products(id),
+    CONSTRAINT fk_cost_reconciliation_transaction FOREIGN KEY (source_transaction_id) REFERENCES inventory_transactions(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_cost_reconciliation_asset FOREIGN KEY (asset_id) REFERENCES inventory_assets(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_cost_reconciliation_assignment FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_cost_reconciliation_user FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+ALTER TABLE inventory_cost_layers
+    ADD CONSTRAINT fk_inventory_cost_layer_reconciliation FOREIGN KEY (reconciliation_id) REFERENCES inventory_cost_reconciliations(id) ON DELETE RESTRICT;
 
 CREATE TABLE IF NOT EXISTS software_installations (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -377,3 +579,10 @@ CREATE TABLE IF NOT EXISTS credential_migration_mappings (
 ) ENGINE=InnoDB;
 -- Permission defaults are deliberately absent; Admins grant each credential capability explicitly.
 INSERT IGNORE INTO credential_departments(name) SELECT DISTINCT TRIM(department) FROM employees WHERE department IS NOT NULL AND TRIM(department)<>'';
+
+DELIMITER //
+CREATE TRIGGER trg_inventory_cost_reconciliation_immutable_update BEFORE UPDATE ON inventory_cost_reconciliations
+FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='Historical cost reconciliations are immutable'; END//
+CREATE TRIGGER trg_inventory_cost_reconciliation_immutable_delete BEFORE DELETE ON inventory_cost_reconciliations
+FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='Historical cost reconciliations are immutable'; END//
+DELIMITER ;

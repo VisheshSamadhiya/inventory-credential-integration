@@ -2,6 +2,13 @@ DirectoryIndex index.php
 Options -Indexes
 RewriteEngine On
 
+# Worker entry points and dependency internals are never web routes.
+RewriteRule ^(?:bin|vendor)(?:/|$) - [F,END]
+RewriteRule (^|/)\. - [F,END]
+<FilesMatch "(?i)\.(?:sql|bak|env|log|zip|ini|ya?ml|lock)$">
+    Require all denied
+</FilesMatch>
+
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ index.php [L]

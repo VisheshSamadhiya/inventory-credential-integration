@@ -3,7 +3,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/credential_helpers.php';
 requireLogin();
 $db = db();
-$storageRoot = getenv('CREDENTIAL_ATTACHMENT_PATH') ?: sys_get_temp_dir() . '/inventory-credential-attachments';
+$storageRoot = getenv('CREDENTIAL_ATTACHMENT_PATH') ?: dirname(__DIR__) . '/storage/credential-attachments';
 if (!is_dir($storageRoot) && !mkdir($storageRoot, 0700, true) && !is_dir($storageRoot)) {
     http_response_code(500); exit('Attachment storage unavailable.');
 }
